@@ -182,9 +182,19 @@ sub populate_new_zone {
   my $res = new Net::DNS::Resolver(nameservers => ['linux-c567.internal.vic.gov.au.']);
   prepare_db($dbh);
   #$res->tsig("$keydir/$view.key");
-  my @rrs = $res->axfr($zone);
-  $soa = shift @rrs;
-  for my $rr (@rrs) {
+  my $nextrr;
+  if ($hasiterator) {
+    $nextrr = $res->axfr($zone);
+  } else {
+    $nextrr = {
+      my @rrs = $res->axfr($zone);
+      return sub {
+        shift @rrs;
+      }
+    }
+  }
+  $soa = $nextrr->();
+  while(my $r = $nextrr->()) {
     add_rr($zoneid, $rr);
   }
 
@@ -238,6 +248,21 @@ print "Creating new resolver for $mname\n";
 $mname = 'linux-c567.internal.vic.gov.au';
   my $resolver = new Net::DNS::Resolver(nameservers => [ $mname ] );
   #$resolver->tsig("$keydir/$view.key");
+  my $nextrr;
+  if ($hasiterator) {
+    if ($hasixfr) {
+###TODO
+    } else {
+      $nextrr = $res->axfr($zone);
+    }
+  } else {
+    $nextrr = {
+      my @rrs = $res->axfr($zone);
+      return sub {
+        shift @rrs;
+      }
+    }
+  }
   #my $qry = $resolver->query($zone, 'IXFR', $soa); # FIX
   #my $iterator = $resolver->axfr($zone, 'IN');
   my @rrs = $resolver->axfr($zone, 'IN');
