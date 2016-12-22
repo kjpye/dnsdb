@@ -1,0 +1,623 @@
+#!/usr/bin/perl -w
+
+use strict;
+use English;
+
+use DBI;
+
+#use lib '/home/kevinp/src/P5-Net-DNS/lib';
+
+use Net::DNS;
+use Net::DNS::Nameserver;
+use Net::DNS::Resolver;
+use Net::DNS::RR::SOA;
+
+use Data::Dumper;
+
+my $verbose = 0;
+$verbose = 1; # uncomment for debugging
+
+my $hasixfr = 0;
+my $hasiterator = 0;
+
+my $keydir = '/etc/named.d';
+
+my @RRtypes = qw(a cname mx ns ptr srv txt);
+
+my $db = 'dns2';
+
+if($#ARGV >= 0) {
+  for my $arg (@ARGV) {
+    my ($zone, $view) = split ':', $arg;
+    $view //= 'unknown';
+    $zone =~ s/\.*$/./;
+    update_zone("$zone $view");
+  }
+  exit 0;
+}
+
+my $readpipe;
+my $writepipe;
+
+sub query_handler {
+  my ($qname, $qclass, $qtype, $peerhost,$query,$conn) = @_;
+  my ($rcode, @ans, @auth, @add);
+
+  print "Received query from $peerhost to ". $conn->{sockhost}. "\n";
+  $query->print;
+
+  return ('NOTIMP', \@ans, \@auth, \@add);
+}
+
+sub notify_handler {
+  my ($qname, $qclass, $qtype, $peerhost,$query,$conn) = @_;
+  my ($rcode, @ans, @auth, @add);
+
+  print "Received notify from $peerhost to ". $conn->{sockhost}. "\n" if $verbose;
+  $query->print if $verbose;
+
+  my $view = 'unknown';
+  for my $rr ($query->additional) {
+    $view = $rr->name if $rr->type eq 'TSIG';
+  }
+  print $writepipe "$qname $view\n";
+  $rcode = 'NOERROR';
+
+  return ($rcode, \@ans, \@auth, \@add);
+}
+
+pipe $readpipe, $writepipe;
+
+my $childid = fork();
+
+if ($childid) { # parent process -- wait for notify and send details to child
+  close $readpipe;
+  my $ofh = select $writepipe;
+  $| = 1;
+  select $ofh;
+  #print $writepipe "parent here:\n";
+  my $ns = new Net::DNS::Nameserver(
+                 LocalPort     => 53,
+                 ReplyHandler  => \&query_handler,
+                 NotifyHandler => \&notify_handler,
+                 Verbose       => 1,
+               ) or die "Couldn't create name server object\n";
+# Drop privilege
+  $UID = 1000;
+  $GID = 100;
+  $ns->main_loop;
+  close $writepipe;
+} else { # child process -- perform zone transfers and update database
+  close $writepipe;
+# Drop privilege
+  $UID = $EUID = 1000;
+  $GID = $EGID = 100;
+  while(my $zone = <$readpipe>) {
+    chomp $zone;
+    $zone =~ s/\.*$/./;
+    update_zone($_);
+  }
+  close $readpipe;
+}
+
+sub get_viewid {
+  my $view = shift;
+  my $dbh = shift;
+  my $viewid = 0;
+
+  return 0 unless $view;
+ 
+print "View: \"$view\"\n";
+
+#  my $sth = $dbh->prepare("INSERT INTO view (name)
+#                           VALUES (?)
+#                           ON CONFLICT DO NOTHING
+#                           RETURNING viewid");
+  my $sth = $dbh->prepare("SELECT viewid
+                           FROM   view
+                           WHERE  name = ?
+                          ");
+  $sth->execute($view);
+  while(my @row = $sth->fetchrow_array()) {
+    $viewid = $row[0];
+  }
+  $viewid;
+}
+
+sub update_zone {
+  my $args = shift;
+  my ($zone, $view) = split ' ', $args;
+  $view //= 'unknown';
+  $view =~ s/\.*$//; # remove any trailing dots
+
+# open database
+  my $dbh = DBI->connect("dbi:Pg:dbname=$db", '', '', {AutoCommit => 0});
+
+# get zone information
+  my $sth = $dbh->prepare("SELECT zoneid
+                           FROM   zone, view
+                           WHERE  zone.name = ?
+                             AND  view.name = ?
+                             AND  zone.view = view.viewid
+                             AND  deleted IS NULL
+                          ");
+  $sth->execute($zone, $view);
+  my $zoneid = 0;
+  while (my @row = $sth->fetchrow_array()) {
+    $zoneid = $row[0];
+  }
+
+  if ( ! $zoneid ) { # zone isn't in database yet
+    populate_new_zone($zone, $view, $dbh);
+  } else {
+    update_existing_zone($zone, $view, $zoneid, $dbh);
+  }
+
+  $dbh->close();
+}
+
+sub populate_new_zone {
+  my $zone = shift;
+  my $view = shift;
+  my $dbh = shift;
+
+#print "Populate '$zone'\n";
+  my $zoneid = 0;
+
+# Get the view id, making sure it exists
+  my $viewid = get_viewid ($view, $dbh);
+
+# create entry in zone table; won't contain a lot yet, but we need the zone id
+  my $sth = $dbh->prepare("INSERT INTO zone (name, view)
+                           VALUES      (?, ?)
+                           RETURNING   zoneid
+                          ");
+  $sth->execute($zone, $viewid);
+  while (my @row = $sth->fetchrow_array()) {
+    $zoneid = $row[0];
+  }
+
+# fetch data and update tables
+  my $soa = undef;
+  my $res = new Net::DNS::Resolver(nameservers => ['linux-c567.internal.vic.gov.au.']);
+  prepare_db($dbh);
+  #$res->tsig("$keydir/$view.key");
+  my @rrs = $res->axfr($zone);
+  $soa = shift @rrs;
+  for my $rr (@rrs) {
+    add_rr($zoneid, $rr);
+  }
+
+# update zone table with new zone
+  if (defined $soa) {
+    $sth = $dbh->prepare("INSERT INTO dns_soa (zone, name, ttl, mname, rname, serial, refresh, retry, expire, minimum)
+                          VALUES              (?,    ?,    ?,   ?,     ?,     ?,      ?,       ?,     ?,      ?      )
+                         ");
+    $sth->execute($zoneid,
+                  $zone,
+                  $soa->ttl,
+                  $soa->mname,
+                  $soa->rname,
+                  $soa->serial,
+                  $soa->refresh,
+                  $soa->retry,
+                  $soa->expire,
+                  $soa->minimum
+                 );
+  }
+
+# Now commit the data so it's visible
+  $dbh->commit();
+}
+
+sub update_existing_zone {
+  my $zone = shift;
+  my $view = shift;
+  my $zoneid = shift;
+  my $dbh = shift;
+
+print "Updating '$zone' ($view, $zoneid)\n";
+# Get the existing SOA as an object
+  my $sth = $dbh->prepare("SELECT mname, serial
+                           FROM dns_soa
+                           WHERE  zone = ?
+                             AND  deleted IS NULL
+                          ");
+  $sth->execute($zoneid);
+  my $mname = 'x';
+  my $serial = 0;
+  while(my @row = $sth->fetchrow_array()) {
+    $mname = $row[0];
+    $serial = $row[1];
+  }
+print $serial, "\n";
+  my $soa = new Net::DNS::RR("$zone SOA z x.y 1 1 1 1 1");
+
+# Make an IXFR query
+print "Creating new resolver for $mname\n";
+$mname = 'linux-c567.internal.vic.gov.au';
+  my $resolver = new Net::DNS::Resolver(nameservers => [ $mname ] );
+  #$resolver->tsig("$keydir/$view.key");
+  #my $qry = $resolver->query($zone, 'IXFR', $soa); # FIX
+  #my $iterator = $resolver->axfr($zone, 'IN');
+  my @rrs = $resolver->axfr($zone, 'IN');
+# Run through each returned RR processing it
+  my $state = 0;
+  #my $newsoa = &$iterator();
+print Dumper(\@rrs);
+  my $newsoa = shift @rrs;
+print Dumper(\$newsoa);
+  #my $newserial = $newsoa->serial;
+  #if ($newserial != $serial) {
+    prepare_db($dbh); # set up all the DB queries
+  #  while (my $rr = &$iterator()) {
+    for my $rr (@rrs) {
+      if ($rr->type eq 'SOA') {
+        if ($state == 0) { # initial state -- this is an IXFR transfer
+          $state = 2;
+        } elsif ($state == 1) { # AXFR -- there shouldn't be an SOA here
+        } elsif ($state == 2) { # adding -- new state is deleting
+          $state = 3;
+        } elsif ($state == 3) { # deleting -- new state is adding
+          $state = 2;
+        } else {
+        }
+      } else {
+        if ($state == 0) { # must be axfr -- process whole zone
+          $state = 1;
+          set_delete($zoneid, $dbh);
+          replace_rr($zoneid, $rr);
+        } elsif ($state == 1) { # doing axfr -- treat specially
+          replace_rr($zoneid, $rr);
+        } elsif ($state == 2) { # deleting
+          del_rr($rr);
+        } elsif ($state == 3) { # adding
+          add_rr($rr);
+        } else { # illegal state
+        }
+      }
+    }
+  #}
+  delete_entries() if $state == 1;
+
+# add the new soa RR
+  update_soa($zoneid, $newsoa, $dbh);
+
+# Now commit the data so it's visible
+  $dbh->commit();
+}
+
+my $add_a;
+my $add_cname;
+my $add_mx;
+my $add_ns;
+my $add_ptr;
+my $add_soa;
+my $add_srv;
+my $add_txt;
+my $del_a;
+my $del_cname;
+my $del_mx;
+my $del_ns;
+my $del_ptr;
+my $del_soa;
+my $del_srv;
+my $del_txt;
+my $keep_a;
+my $keep_cname;
+my $keep_mx;
+my $keep_ns;
+my $keep_ptr;
+my $keep_soa;
+my $keep_srv;
+my $keep_txt;
+ 
+sub prepare_db {
+  my $dbh = shift;
+
+  $add_a     = $dbh->prepare("INSERT INTO dns_a     (name, zone, ttl, address)
+                              VALUES                (?,    ?,    ?,   ?      )
+                             ");
+  $del_a     = $dbh->prepare("UPDATE dns_a
+                              SET    deleted = now()
+                              WHERE  name = ?
+                                AND  zone = ?
+                                AND  ttl = ?
+                                AND  address = ?
+                                AND  deleted IS NULL
+                             ");
+  $keep_a     = $dbh->prepare("UPDATE dns_a
+                              SET    pendingdelete = 0
+                              WHERE  name = ?
+                                AND  zone = ?
+                                AND  ttl = ?
+                                AND  address = ?
+                                AND  deleted IS NULL
+                             ");
+  $add_cname = $dbh->prepare("INSERT INTO dns_cname (name, zone, ttl, cname)
+                              VALUES                (?,    ?,    ?,   ?    )
+                             ");
+  $del_cname = $dbh->prepare("UPDATE dns_cname
+                              SET    deleted = now()
+                              WHERE  name = ?
+                                AND  zone = ?
+                                AND  ttl = ?
+                                AND  cname = ?
+                                AND  deleted IS NULL
+                             ");
+  $keep_cname = $dbh->prepare("UPDATE dns_cname
+                              SET    pendingdelete = 0
+                              WHERE  name = ?
+                                AND  zone = ?
+                                AND  ttl = ?
+                                AND  cname = ?
+                                AND  deleted IS NULL
+                             ");
+  $add_mx    = $dbh->prepare("INSERT INTO dns_mx    (name, zone, ttl, exchange, preference)
+                              VALUES                (?,    ?,    ?,   ?,        ?         )
+                             ");
+  $del_mx    = $dbh->prepare("UPDATE dns_mx
+                              SET    deleted = now()
+                              WHERE  name = ?
+                                AND  zone = ?
+                                AND  ttl = ?
+                                AND  exchange = ?
+                                AND  preference = ?
+                                AND  deleted IS NULL
+                             ");
+  $keep_mx    = $dbh->prepare("UPDATE dns_mx
+                               SET    pendingdelete = 0
+                               WHERE  name = ?
+                                 AND  zone = ?
+                                 AND  ttl = ?
+                                 AND  exchange = ?
+                                 AND  preference = ?
+                                 AND  deleted IS NULL
+                              ");
+  $add_ns    = $dbh->prepare("INSERT INTO dns_ns    (name, zone, ttl, nsdname)
+                              VALUES                (?,    ?,    ?,   ?      )
+                             ");
+  $del_ns    = $dbh->prepare("UPDATE dns_ns
+                              SET    deleted = now()
+                              WHERE  name = ?
+                                AND  zone = ?
+                                AND  ttl = ?
+                                AND  nsdname = ?
+                                AND  deleted IS NULL
+                             ");
+  $keep_ns    = $dbh->prepare("UPDATE dns_ns
+                               SET    pendingdelete = 0
+                               WHERE  name = ?
+                                 AND  zone = ?
+                                 AND  ttl = ?
+                                 AND  nsdname = ?
+                                 AND  deleted IS NULL
+                              ");
+  $add_ptr   = $dbh->prepare("INSERT INTO dns_ptr   (name, zone, ttl, address, ptrdname)
+                              VALUES                (?,    ?,    ?,   ?,       ?       )
+                             ");
+  $del_ptr   = $dbh->prepare("UPDATE dns_ptr
+                              SET    deleted = now()
+                              WHERE  name = ?
+                                AND  zone = ?
+                                AND  ttl = ?
+                                AND  address = ?
+                                AND  ptrdname = ?
+                                AND  deleted IS NULL
+                             ");
+  $keep_ptr   = $dbh->prepare("UPDATE dns_ptr
+                               SET    pendingdelete = 0
+                               WHERE  name = ?
+                                 AND  zone = ?
+                                 AND  ttl = ?
+                                 AND  address = ?
+                                 AND  ptrdname = ?
+                                 AND  deleted IS NULL
+                              ");
+  $del_soa   = $dbh->prepare("UPDATE dns_soa
+                              SET    deleted = now()
+                              WHERE  zone = ?
+                                AND  ttl = ?
+                                AND  mname = ?
+                                AND  rname = ?
+                                AND  serial = ?
+                                AND  refresh = ?
+                                AND  retry = ?
+                                AND  expire = ?
+                                AND  minimum = ?
+                                AND  deleted IS NULL
+                             ");
+  $add_srv   = $dbh->prepare("INSERT INTO dns_srv   (name, zone, ttl, priority, weight, port, target)
+                              VALUES                (?,    ?,    ?,   ?,        ?,      ?,    ?     )
+                             ");
+  $del_srv   = $dbh->prepare("UPDATE dns_srv
+                              SET    deleted = now()
+                              WHERE  name = ?
+                                AND  zone = ?
+                                AND  ttl = ?
+                                AND  priority = ?
+                                AND  weight = ?
+                                AND  port = ?
+                                AND  target = ?
+                                AND  deleted IS NULL
+                             ");
+  $keep_srv   = $dbh->prepare("UPDATE dns_srv
+                               SET    pendingdelete = 0
+                               WHERE  name = ?
+                                 AND  zone = ?
+                                 AND  ttl = ?
+                                 AND  priority = ?
+                                 AND  weight = ?
+                                 AND  port = ?
+                                 AND  target = ?
+                                 AND  deleted IS NULL
+                              ");
+  $add_txt   = $dbh->prepare("INSERT INTO dns_txt   (name, zone, ttl, txtdata)
+                              VALUES                (?,    ?,    ?,   ?      )
+                             ");
+  $del_txt   = $dbh->prepare("UPDATE dns_txt
+                              SET    deleted = now()
+                              WHERE  name = ?
+                                AND  zone = ?
+                                AND  ttl = ?
+                                AND  txtdata = ?
+                                AND  deleted IS NULL
+                             ");
+  $keep_txt   = $dbh->prepare("UPDATE dns_txt
+                               SET    pendingdelete = 0
+                               WHERE  name = ?
+                                 AND  zone = ?
+                                 AND  ttl = ?
+                                 AND  txtdata = ?
+                                 AND  deleted IS NULL
+                              ");
+}
+
+sub set_delete {
+  my $zone = shift;
+  my $dbh = shift;
+
+  for my $type (@RRtypes) {
+    my $sth = $dbh->prepare("UPDATE dns_$type    
+                             SET pendingdelete = 1
+                             WHERE zone = ?
+                               AND deleted IS NULL
+                            ");
+     $sth->execute($zone);
+  }
+}
+
+sub delete_entries {
+  my $zone = shift;
+  my $dbh = shift;
+
+  for my $type (@RRtypes) {
+    my $sth = $dbh->prepare("UPDATE dns_$type    
+                             SET deleted = now(), pendingdelete = 1
+                             WHERE zone = ?
+                               AND deleted IS NULL
+                            ");
+    $sth->execute($zone);
+  }
+}
+
+# add the RR to the database
+
+sub add_rr {
+  my $zoneid = shift;
+  my $rr = shift;
+
+  if ($rr->type eq 'A') {
+    $add_a->execute($rr->name, $zoneid, $rr->ttl, $rr->address);
+  } elsif ($rr->type eq 'CNAME') {
+    $add_cname->execute($rr->name, $zoneid, $rr->ttl, $rr->cname);
+  } elsif ($rr->type eq 'MX') {
+    $add_mx->execute($rr->name, $zoneid, $rr->ttl, $rr->exchange, $rr->preference);
+  } elsif ($rr->type eq 'NS') {
+    $add_ns->execute($rr->name, $zoneid, $rr->ttl, $rr->nsdname);
+  } elsif ($rr->type eq 'PTR') {
+    $add_ptr->execute($rr->name, $zoneid, $rr->ttl, $rr->address, $rr->ptrdname);
+  } elsif ($rr->type eq 'SRV') {
+    $add_srv->execute($rr->name, $zoneid, $rr->ttl, $rr->priority, $rr->weight, $rr->port, $rr->target);
+  } elsif ($rr->type eq 'TXT') {
+    $add_txt->execute($rr->name, $zoneid, $rr->ttl, $rr->txtdata);
+  } else {
+    # just ignore other types (including SOA) -- should probably raise an error somewhere
+  }
+}
+
+# delete the RR from the database
+
+sub del_rr {
+  my $zoneid = shift;
+  my $rr = shift;
+
+  if ($rr->type eq 'A') {
+    $del_a->execute($rr->name, $zoneid, $rr->ttl, $rr->address);
+  } elsif ($rr->type eq 'CNAME') {
+    $del_cname->execute($rr->name, $zoneid, $rr->ttl, $rr->cname);
+  } elsif ($rr->type eq 'MX') {
+    $del_a->execute($rr->name, $zoneid, $rr->ttl, $rr->exchange, $rr->preference);
+  } elsif ($rr->type eq 'NS') {
+    $del_ns->execute($rr->name, $zoneid, $rr->ttl, $rr->nsdname);
+  } elsif ($rr->type eq 'PTR') {
+    $del_ptr->execute($rr->name, $zoneid, $rr->ttl, $rr->address, $rr->ptrdname);
+  } elsif ($rr->type eq 'SOA') {
+    $del_soa->execute($zoneid,
+                      $rr->ttl,
+                      $rr->mname,
+                      $rr->rname,
+                      $rr->serial,
+                      $rr->refresh,
+                      $rr->retry,
+                      $rr->expire,
+                      $rr->minimum,
+                      $zoneid
+                     );
+  } elsif ($rr->type eq 'SRV') {
+    $del_srv->execute($rr->name, $zoneid, $rr->ttl, $rr->priority, $rr->weight, $rr->port, $rr->target);
+  } elsif ($rr->type eq 'TXT') {
+    $del_txt->execute($rr->name, $zoneid, $rr->ttl, $rr->txtdata);
+  } else {
+    # just ignore other types -- should probably raise an error somewhere
+  }
+}
+
+# ensure the RR is in the database
+#
+# This is used when doing an AXFR for an existing zone.
+#
+# It will mark an existing entry to be retained if it already exists
+# and matches, otherwise it will insert a new entry.
+
+sub replace_rr {
+  my $zoneid = shift;
+  my $rr = shift;
+print Dumper(\$rr);
+
+  if ($rr->type eq 'A') {
+    $del_a->execute($rr->name, $zoneid, $rr->ttl, $rr->address);
+  } elsif ($rr->type eq 'CNAME') {
+    $del_cname->execute($rr->name, $zoneid, $rr->ttl, $rr->cname);
+  } elsif ($rr->type eq 'MX') {
+    $del_a->execute($rr->name, $zoneid, $rr->ttl, $rr->exchange, $rr->preference);
+  } elsif ($rr->type eq 'NS') {
+    $del_ns->execute($rr->name, $zoneid, $rr->ttl, $rr->nsdname);
+  } elsif ($rr->type eq 'PTR') {
+    $del_ptr->execute($rr->name, $zoneid, $rr->ttl, $rr->address, $rr->ptrdname);
+  } elsif ($rr->type eq 'SRV') {
+    $del_srv->execute($rr->name, $zoneid, $rr->ttl, $rr->priority, $rr->weight, $rr->port, $rr->target);
+  } elsif ($rr->type eq 'TXT') {
+    $del_txt->execute($rr->name, $zoneid, $rr->ttl, $rr->txtdata);
+  } else {
+    # just ignore other types (including SOA) -- should probably raise an error somewhere
+  }
+}
+
+sub update_soa {
+  my $zone = shift;
+  my $soa = shift;
+  my $dbh = shift;
+
+  my $sth = $dbh->prepare("UPDATE dns_soa
+                           SET    deleted = now()
+                           WHERE  zone    = ?
+                             AND  deleted IS NULL
+                          ");
+  $sth->execute($zone);
+  $sth= $dbh->prepare("INSERT INTO dns_soa (zone, ttl, mname, rname, serial, refresh, retry, expire, minimum)
+                       VALUES              (?,    ?,   ?,     ?,     ?,      ?,       ?,     ?,      ?      )
+                      ");
+  $sth->execute($zone,
+                $soa->ttl,
+                $soa->mname,
+                $soa->rname,
+                $soa->serial,
+                $soa->refresh,
+                $soa->retry,
+                $soa->expire,
+                $soa->minimum,
+               );
+}
+
+exit 0;

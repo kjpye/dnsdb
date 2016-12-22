@@ -1,0 +1,114 @@
+-- Data definition for information about dns zones
+
+create table view (
+  viewid int primary key,
+  name text
+);
+
+insert into view (viewid, name) values (-1, 'unknown');
+insert into view (viewid, name) values ( 0, '');
+insert into view (viewid, name) values ( 1, 'master');
+insert into view (viewid, name) values ( 2, 'internal');
+insert into view (viewid, name) values ( 3, 'dhhs');
+insert into view (viewid, name) values ( 4, 'ahe');
+
+create sequence zone_id;
+
+create table zone (
+  zoneid       bigint    primary key default nextval('zone_id'),
+  name         text      not null,
+  view         int       references view,
+  created      timestamp default now(),
+  deleted      timestamp
+);
+
+create table dns_a (
+  name          text,
+  zone          bigint    references zone(zoneid),
+  ttl           integer,
+  address       inet,
+  created       timestamp default now(),
+  deleted       timestamp,
+  pendingdelete integer
+);
+
+create table dns_soa (
+  zone          bigint    references zone(zoneid),
+  name          text,
+  ttl           integer,
+  mname         text,
+  rname         text,
+  serial        bigint,
+  refresh       integer,
+  retry         integer,
+  expire        integer,
+  minimum       integer,
+  created       timestamp default now(),
+  deleted       timestamp
+);
+
+create table dns_cname (
+  name          text,
+  zone          bigint    references zone(zoneid),
+  ttl           integer,
+  cname         text,
+  created       timestamp default now(),
+  deleted       timestamp,
+  pendingdelete integer
+);
+
+create table dns_ptr (
+  name          text,
+  address       inet,
+  zone          bigint    references zone(zoneid),
+  ttl           integer,
+  ptrdname      text,
+  created       timestamp default now(),
+  deleted       timestamp,
+  pendingdelete integer
+);
+
+create table dns_ns (
+  name          text,
+  zone          bigint    references zone(zoneid),
+  ttl           integer,
+  nsdname       text,
+  created       timestamp default now(),
+  deleted       timestamp,
+  pendingdelete integer
+);
+
+create table dns_txt (
+  name          text,
+  zone          bigint    references zone(zoneid),
+  ttl           integer,
+  txtdata       text,
+  created       timestamp default now(),
+  deleted       timestamp,
+  pendingdelete integer
+);
+
+create table dns_mx (
+  name          text,
+  zone          bigint    references zone(zoneid),
+  ttl           integer,
+  exchange      text,
+  preference    integer,
+  created       timestamp default now(),
+  deleted       timestamp,
+  pendingdelete integer
+);
+
+create table dns_srv (
+  name          text,
+  zone          bigint    references zone(zoneid),
+  ttl           integer,
+  priority      integer,
+  weight        integer,
+  port          integer,
+  target        text,
+  created       timestamp default now(),
+  deleted       timestamp,
+  pendingdelete integer
+);
+

@@ -1,0 +1,253 @@
+#!/usr/bin/perl -w
+
+# Parse the ixfr or axfr packet received as the result of an ixfr query
+
+BEGIN { unshift @INC, '/users/support/kpye1609/dns'; }
+
+use Time::HiRes qw(time);
+
+use Net::DNS; # Use our local version -- it knows how to do incremental transfers
+use DBI;
+use strict;
+
+my $starttime = Time::HiRes::time();
+sub logit {
+  my $msg = shift;
+  my $time = Time::HiRes::time() - $starttime;
+#  print STDERR sprintf("[%.6f] ", $time) . $msg . "\n";
+}
+
+my $state = 0; # initialising
+my $target_serial = -1;
+
+my $db = 'unixservices';
+
+my $dbh = DBI->connect("dbi:Pg:dbname=$db", '', '', {AutoCommit => 0});
+my $sth;
+
+my $zone;    # a global because it applies to all following entries
+my $zoneid; # a global because it applies to all following entries
+my $final_soa;
+
+sub make_soa {
+  my $soa = shift;
+#$soa->print;
+  if ($state == 0) {
+# This is the first SOA we've seen;
+# we don't yet know whether this is an IXFR or AXFR stream;
+    $final_soa = $soa;
+#print $final_soa, $soa, "\n";
+    $target_serial = $final_soa->serial;
+    $state = 1; # Waiting for SOA or AXFR
+    return;
+  }
+  if ($state == 1) {
+    $state = 2; # Deleting
+    return;
+  }
+  if ($state == 2) {
+    $state = 3; # Adding
+    return;
+  }
+  if ($state == 3) {
+    $dbh->commit();
+    if ($soa->serial == $target_serial) { # Finished!
+# We'll never actually get here; this code copied to finalise_soa
+#      # delete the old SOA RR
+#      $dbh->do("UPDATE SOA set deleted = now() where zone = $zoneid AND deleted IS NULL"); # check security
+#      # create the new SOA RR
+#      $sth = $dbh->prepare("INSERT INTO SOA (zone, ttl, server, contact, serial, refresh, retry, expire, minimum) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);");
+#      $sth->execute($zoneid, $soa->ttl, $soa->mname, $soa->rname, $soa->serial, $soa->refresh, $soa->retry, $soa->expire, $soa->minimum);
+#      $dbh->commit();
+      return;
+    }
+    $state = 2; # Deleting
+    return;
+  }
+  if ($state == 4) {
+# end of AXFR; delete everything not explicitly added
+# moved to finalise_soa
+    return;
+  }
+  die "Unknown state $state\n";
+}
+
+sub finalise_soa {
+  my $serial = shift || 0; # the old serial number
+  logit "In finalise_soa (state $state)";
+  if ($state == 4) { # end of axfr
+    $dbh->do("UPDATE dns_A set deleted = now(), pendingdelete = 0 where zone = $zoneid AND pendingdelete = 1;");
+    $dbh->do("UPDATE dns_PTR set deleted = now(), pendingdelete = 0 where zone = $zoneid AND pendingdelete = 1;");
+    $dbh->do("UPDATE dns_CNAME set deleted = now(), pendingdelete = 0 where zone = $zoneid AND pendingdelete = 1;");
+    $dbh->do("UPDATE dns_TXT set deleted = now(), pendingdelete = 0 where zone = $zoneid AND pendingdelete = 1;");
+    $dbh->do("UPDATE dns_NS set deleted = now(), pendingdelete = 0 where zone = $zoneid AND pendingdelete = 1;");
+    $dbh->do("UPDATE dns_MX set deleted = now(), pendingdelete = 0 where zone = $zoneid AND pendingdelete = 1;");
+    $dbh->do("UPDATE dns_SRV set deleted = now(), pendingdelete = 0 where zone = $zoneid AND pendingdelete = 1;");
+  }
+  # delete the old SOA RR
+  if ($serial != $final_soa->serial) {
+    logit "  update soa";
+    $dbh->do("UPDATE dns_SOA set deleted = now() where zone = $zoneid AND deleted IS NULL"); # check security
+    # create the new SOA RR
+    $sth = $dbh->prepare("INSERT INTO dns_SOA (zone, ttl, mname, rname, serial, refresh, retry, expire, minimum) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);");
+    $sth->execute($zoneid,
+                  $final_soa->ttl,
+                  $final_soa->mname,
+                  $final_soa->rname,
+                  $final_soa->serial,
+                  $final_soa->refresh,
+                  $final_soa->retry,
+                  $final_soa->expire,
+                  $final_soa->minimum);
+  }
+  logit "  commit";
+  $dbh->commit();
+  $state = 0;
+  logit "  return";
+}
+
+my %rr_types = ();
+
+sub make_cmd {
+  my $RR_type = shift;
+  my @args = @_;
+  my @argnames = ();
+ 
+  my $delete = "UPDATE dns_$RR_type set deleted = now() WHERE name ilike ? AND zone = ? AND ttl = ? AND deleted IS NULL";
+  my $select = "SELECT ttl from dns_$RR_type WHERE name ilike ? AND zone = ? AND deleted IS NULL";
+  my $nodelete = "UPDATE dns_$RR_type set pendingdelete = 0 WHERE name ilike ? AND zone = ? AND deleted IS NULL";
+  my $insert = "INSERT INTO dns_$RR_type (name, zone, ttl"; # VALUES (?, ?, ?, ?)";
+  my $insertval = '?, ?, ?';
+
+  for my $arg (@args) {
+    push @argnames, $arg;
+    $delete .= " AND $arg = ?";
+    $select .= " AND $arg = ?";
+    $nodelete .= " AND $arg = ?";
+    $insert .= ", $arg";
+    $insertval .= ', ?';
+  }
+  $insert = "$insert) VALUES ($insertval)";
+
+#print "delete $RR_type: $delete\n";
+#print "select $RR_type: $select\n";
+#print "nodelete $RR_type: $nodelete\n";
+#print "insert $RR_type: $insert\n";
+
+  return sub {
+    my ($zoneid, $rr) = @_;
+    my @args = ();
+# calculate args
+    for my $arg (@argnames) {
+      push @args, $rr->$arg;
+    }
+    if ($state == 2) { # deleting
+      my $sth2 = $dbh->prepare($delete);
+      $sth2->execute($rr->name, $zoneid, $rr->ttl, @args);
+      return;
+    } else {
+      my $sth = $dbh->prepare($select);
+      $sth->execute($rr->name, $zoneid, @args);
+      my @row;
+      while (@row = $sth->fetchrow_array()) {
+        if ($row[0] = $rr->ttl) {
+          # matching record -- just remove delete flag
+          my $sth2 = $dbh->prepare($nodelete);
+          $sth2->execute($rr->name, $zoneid, @args);
+          return;
+        }
+      }
+  # allow any existing record to be deleted later,
+  # and create a new record with the correct TTL:
+      my $sth3 = $dbh->prepare($insert);
+      $sth3->execute($rr->name, $zoneid, $rr->ttl, @args);
+    }
+  }
+}
+
+$rr_types{'a'}     = make_cmd('a',     qw(address));
+$rr_types{'ns'}    = make_cmd('ns',    qw(nsdname));
+$rr_types{'mx'}    = make_cmd('mx',    qw(preference exchange));
+$rr_types{'txt'}   = make_cmd('txt',   qw(txtdata));
+$rr_types{'srv'}   = make_cmd('srv',   qw(priority weight port target));
+$rr_types{'cname'} = make_cmd('cname', qw(cname));
+$rr_types{'ptr'}   = make_cmd('ptr',   qw(address ptrdname));
+
+for my $zone (@ARGV) {
+  $zone =~ s/\.$//; # canonicalise zone name
+#print STDERR "Zone $zone...\n";
+  my $sth = $dbh->prepare("SELECT zoneid FROM dns_zone WHERE zone ilike ? AND dnsdb = 1 AND deleted IS NULL");
+  $sth->execute($zone);
+  my $exists = 0;
+  while (my @row = $sth->fetchrow_array()) {
+    $exists = 1;
+  }
+  if (! $exists) {
+#print STDERR "Inserting new zone $zone\n";
+    $sth = $dbh->prepare("INSERT INTO dns_zone (zone, dnsdb) VALUES (?, 1)");
+    $sth->execute($zone);
+    $dbh->commit();
+  }
+}
+
+# This is where the work really starts
+
+my $sth_zone = $dbh->prepare("SELECT zone, zoneid FROM dns_zone WHERE dnsdb = 1 AND deleted IS NULL");
+$sth_zone->execute();
+while (my @row = $sth_zone->fetchrow_array()) {
+  $zone = $row[0];
+  $zoneid = $row[1];
+  logit "Updating zone $zone...";
+  logit "Get serial";
+  my $sth_soa = $dbh->prepare("SELECT serial FROM dns_soa WHERE zone = ? AND deleted IS NULL");
+  $sth_soa->execute($zoneid);
+  my $serial;
+  while (my @row = $sth_soa->fetchrow_array()) {
+    $serial = $row[0];
+  }
+  logit "        done";
+  my $res = Net::DNS::Resolver->new(nameservers => ['127.0.0.1'], recurse => 0, debug => 0) || die "Could not create resolver object for zone $zone\n";
+  if (! defined $serial) { # use axfr
+  logit "Using axfr";
+    $res->axfr_start($zone, "IN");
+  } else { #use ixfr
+  logit "Using ixfr";
+    my $soa = Net::DNS::RR->new("$zone 3600 SOA $zone root.$zone $serial 3600 1800 36000 7200"); # garbage values in most fields
+    $res->axfr_start($zone, "IN", $soa);
+  }
+  logit "Parse RRs";
+  while (my $rr = $res->axfr_next()) {
+    if (lc $rr->type eq 'soa') {
+      make_soa($rr);
+      next;
+    }
+# Having got here we have a RR which is NOT an SOA
+    if ($state == 1) {
+# We've seen only one SOA record;
+# therefore this is an AXFR stream, and we need to delete everything
+# and add the RRs which follow
+      $dbh->do("UPDATE dns_A set pendingdelete = 1 where zone = $zoneid AND deleted IS NULL;");
+      $dbh->do("UPDATE dns_PTR set pendingdelete = 1 where zone = $zoneid AND deleted IS NULL;");
+      $dbh->do("UPDATE dns_CNAME set pendingdelete = 1 where zone = $zoneid AND deleted IS NULL;");
+      $dbh->do("UPDATE dns_TXT set pendingdelete = 1 where zone = $zoneid AND deleted IS NULL;");
+      $dbh->do("UPDATE dns_NS set pendingdelete = 1 where zone = $zoneid AND deleted IS NULL;");
+      $dbh->do("UPDATE dns_MX set pendingdelete = 1 where zone = $zoneid AND deleted IS NULL;");
+      $dbh->do("UPDATE dns_SRV set pendingdelete = 1 where zone = $zoneid AND deleted IS NULL;");
+      $state = 4;
+    }
+    if ($rr->type eq 'PTR') {
+      my @addr = split '\.', $rr->name;
+      $rr->{'address'} = $addr[3] . '.' . $addr[2] . '.' . $addr[1] . '.' . $addr[0];
+    }
+    if (defined $rr_types{lc $rr->type}) {
+      #$rr_types{lc $rr->type}(lc $rr->type, $zoneid, $rr);
+      $rr_types{lc $rr->type}($zoneid, $rr);
+    } else {
+      print STDERR "Unknown RRtype $rr->type!\n";
+    }
+  }
+  logit "Finalise";
+  finalise_soa($serial);
+  logit "Commit";
+  $dbh->commit;
+}
