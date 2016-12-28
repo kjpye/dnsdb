@@ -29,7 +29,7 @@ create table dns_a (
   address       inet,
   created       timestamp default now(),
   deleted       timestamp,
-  pendingdelete integer
+  pendingdelete integer default 0
 );
 
 create table dns_soa (
@@ -54,7 +54,7 @@ create table dns_cname (
   cname         text,
   created       timestamp default now(),
   deleted       timestamp,
-  pendingdelete integer
+  pendingdelete integer default 0
 );
 
 create table dns_ptr (
@@ -65,7 +65,7 @@ create table dns_ptr (
   ptrdname      text,
   created       timestamp default now(),
   deleted       timestamp,
-  pendingdelete integer
+  pendingdelete integer default 0
 );
 
 create table dns_ns (
@@ -75,7 +75,7 @@ create table dns_ns (
   nsdname       text,
   created       timestamp default now(),
   deleted       timestamp,
-  pendingdelete integer
+  pendingdelete integer default 0
 );
 
 create table dns_txt (
@@ -85,7 +85,7 @@ create table dns_txt (
   txtdata       text,
   created       timestamp default now(),
   deleted       timestamp,
-  pendingdelete integer
+  pendingdelete integer default 0
 );
 
 create table dns_mx (
@@ -96,7 +96,7 @@ create table dns_mx (
   preference    integer,
   created       timestamp default now(),
   deleted       timestamp,
-  pendingdelete integer
+  pendingdelete integer default 0
 );
 
 create table dns_srv (
@@ -109,6 +109,6 @@ create table dns_srv (
   target        text,
   created       timestamp default now(),
   deleted       timestamp,
-  pendingdelete integer
+  pendingdelete integer default 0
 );
 

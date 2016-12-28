@@ -15,7 +15,7 @@ use Net::DNS::RR::SOA;
 use Data::Dumper;
 
 my $verbose = 0;
-$verbose = 1; # uncomment for debugging
+#$verbose = 1; # uncomment for debugging
 
 my $hasixfr = 0;
 my $hasiterator = 0;
@@ -95,7 +95,7 @@ if ($childid) { # parent process -- wait for notify and send details to child
   while(my $zone = <$readpipe>) {
     chomp $zone;
     $zone =~ s/\.*$/./;
-    update_zone($_);
+    update_zone($zone);
   }
   close $readpipe;
 }
@@ -107,7 +107,7 @@ sub get_viewid {
 
   return 0 unless $view;
  
-print "View: \"$view\"\n";
+  print "View: \"$view\"\n" if $verbose;
 
 #  my $sth = $dbh->prepare("INSERT INTO view (name)
 #                           VALUES (?)
@@ -126,7 +126,10 @@ print "View: \"$view\"\n";
 
 sub update_zone {
   my $args = shift;
+  print "Args: \"$args\"\n" if $verbose;
   my ($zone, $view) = split ' ', $args;
+  $zone =~ s/\.*$//;
+  $zone .= '.'; # force trailing dot
   $view //= 'unknown';
   $view =~ s/\.*$//; # remove any trailing dots
 
@@ -153,7 +156,14 @@ sub update_zone {
     update_existing_zone($zone, $view, $zoneid, $dbh);
   }
 
-  $dbh->close();
+  $dbh->disconnect();
+}
+
+sub make_iterator {
+  my @rrs = @_;
+  print "RRs are ", Dumper(\@rrs), "\n" if $verbose;
+  print scalar @rrs, " RRs\n";
+  return sub { shift @rrs; };
 }
 
 sub populate_new_zone {
@@ -161,7 +171,7 @@ sub populate_new_zone {
   my $view = shift;
   my $dbh = shift;
 
-#print "Populate '$zone'\n";
+  print "Populate '$zone'\n" if $verbose;
   my $zoneid = 0;
 
 # Get the view id, making sure it exists
@@ -179,26 +189,24 @@ sub populate_new_zone {
 
 # fetch data and update tables
   my $soa = undef;
-  my $res = new Net::DNS::Resolver(nameservers => ['linux-c567.internal.vic.gov.au.']);
+  my $res = new Net::DNS::Resolver(nameservers => ['linux-c567.internal.vic.gov.au.']) or die "Could not create resolver\n";
   prepare_db($dbh);
   #$res->tsig("$keydir/$view.key");
   my $nextrr;
   if ($hasiterator) {
     $nextrr = $res->axfr($zone);
   } else {
-    $nextrr = {
-      my @rrs = $res->axfr($zone);
-      return sub {
-        shift @rrs;
-      }
-    }
+    my @rrs = $res->axfr($zone);
+    $nextrr = make_iterator(@rrs);
   }
   $soa = $nextrr->();
-  while(my $r = $nextrr->()) {
+  print "Initial SOA: ", Dumper(\$soa), "\n" if $verbose;
+  while(my $rr = $nextrr->()) {
     add_rr($zoneid, $rr);
   }
 
 # update zone table with new zone
+  print "Updating soa\n" if $verbose;
   if (defined $soa) {
     $sth = $dbh->prepare("INSERT INTO dns_soa (zone, name, ttl, mname, rname, serial, refresh, retry, expire, minimum)
                           VALUES              (?,    ?,    ?,   ?,     ?,     ?,      ?,       ?,     ?,      ?      )
@@ -217,6 +225,7 @@ sub populate_new_zone {
   }
 
 # Now commit the data so it's visible
+  print "Committing data\n" if $verbose;
   $dbh->commit();
 }
 
@@ -226,7 +235,7 @@ sub update_existing_zone {
   my $zoneid = shift;
   my $dbh = shift;
 
-print "Updating '$zone' ($view, $zoneid)\n";
+  print "Updating '$zone' ($view, $zoneid)\n" if $verbose;
 # Get the existing SOA as an object
   my $sth = $dbh->prepare("SELECT mname, serial
                            FROM dns_soa
@@ -240,11 +249,12 @@ print "Updating '$zone' ($view, $zoneid)\n";
     $mname = $row[0];
     $serial = $row[1];
   }
-print $serial, "\n";
-  my $soa = new Net::DNS::RR("$zone SOA z x.y 1 1 1 1 1");
+  print "Old serial number: ", $serial, "\n" if $verbose;
+# Create an SOA RR with the old serial number we can attach to an IXFR query
+  my $soa = new Net::DNS::RR("$zone SOA z x.y $serial 1 1 1 1");
 
-# Make an IXFR query
-print "Creating new resolver for $mname\n";
+# Make an AXFR/IXFR query
+  print "Creating new resolver for $mname\n" if $verbose;
 $mname = 'linux-c567.internal.vic.gov.au';
   my $resolver = new Net::DNS::Resolver(nameservers => [ $mname ] );
   #$resolver->tsig("$keydir/$view.key");
@@ -253,15 +263,11 @@ $mname = 'linux-c567.internal.vic.gov.au';
     if ($hasixfr) {
 ###TODO
     } else {
-      $nextrr = $res->axfr($zone);
+      $nextrr = $resolver->axfr($zone);
     }
   } else {
-    $nextrr = {
-      my @rrs = $res->axfr($zone);
-      return sub {
-        shift @rrs;
-      }
-    }
+    my @rrs = $resolver->axfr($zone);
+    $nextrr = make_iterator(@rrs);
   }
   #my $qry = $resolver->query($zone, 'IXFR', $soa); # FIX
   #my $iterator = $resolver->axfr($zone, 'IN');
@@ -269,14 +275,15 @@ $mname = 'linux-c567.internal.vic.gov.au';
 # Run through each returned RR processing it
   my $state = 0;
   #my $newsoa = &$iterator();
-print Dumper(\@rrs);
+  print "RRs read: ", Dumper(\@rrs), "\n" if $verbose;
   my $newsoa = shift @rrs;
-print Dumper(\$newsoa);
+  print "New SOA: :", Dumper(\$newsoa), "\n" if $verbose;
   #my $newserial = $newsoa->serial;
   #if ($newserial != $serial) {
     prepare_db($dbh); # set up all the DB queries
   #  while (my $rr = &$iterator()) {
     for my $rr (@rrs) {
+      print "Handling RR: ", Dumper(\$rr), "\n" if $verbose;
       if ($rr->type eq 'SOA') {
         if ($state == 0) { # initial state -- this is an IXFR transfer
           $state = 2;
@@ -303,10 +310,11 @@ print Dumper(\$newsoa);
       }
     }
   #}
-  delete_entries() if $state == 1;
+  print "Deleting old entries\n" if $verbose;
+  delete_entries($zoneid, $dbh) if $state == 1;
 
 # add the new soa RR
-  update_soa($zoneid, $newsoa, $dbh);
+  update_soa($zone, $zoneid, $newsoa, $dbh);
 
 # Now commit the data so it's visible
   $dbh->commit();
@@ -509,6 +517,7 @@ sub set_delete {
                                AND deleted IS NULL
                             ");
      $sth->execute($zone);
+$dbh->commit();
   }
 }
 
@@ -518,12 +527,24 @@ sub delete_entries {
 
   for my $type (@RRtypes) {
     my $sth = $dbh->prepare("UPDATE dns_$type    
-                             SET deleted = now(), pendingdelete = 1
-                             WHERE zone = ?
-                               AND deleted IS NULL
+                             SET deleted       = now(),
+                                 pendingdelete = 0
+                             WHERE zone           = ?
+                               AND pendingdelete  = 1
+                               AND deleted       IS NULL
                             ");
     $sth->execute($zone);
   }
+}
+
+sub name2ip {
+  my $name = shift;
+print "name2ip: $name\n";
+  $name =~ s/\.in-addr.arpa//i;
+print "name2ip: $name\n";
+  my @octets = split /\./, $name;
+print Dumper(\@octets), "\n";
+  join '.', reverse @octets;
 }
 
 # add the RR to the database
@@ -532,19 +553,22 @@ sub add_rr {
   my $zoneid = shift;
   my $rr = shift;
 
-  if ($rr->type eq 'A') {
+  my $type = $rr->type;
+  print "add rr ($type): ", Dumper(\$rr), "\n"; # if $verbose;
+  if ($type eq 'A') {
     $add_a->execute($rr->name, $zoneid, $rr->ttl, $rr->address);
-  } elsif ($rr->type eq 'CNAME') {
+  } elsif ($type eq 'CNAME') {
     $add_cname->execute($rr->name, $zoneid, $rr->ttl, $rr->cname);
-  } elsif ($rr->type eq 'MX') {
+  } elsif ($type eq 'MX') {
     $add_mx->execute($rr->name, $zoneid, $rr->ttl, $rr->exchange, $rr->preference);
-  } elsif ($rr->type eq 'NS') {
+  } elsif ($type eq 'NS') {
     $add_ns->execute($rr->name, $zoneid, $rr->ttl, $rr->nsdname);
-  } elsif ($rr->type eq 'PTR') {
-    $add_ptr->execute($rr->name, $zoneid, $rr->ttl, $rr->address, $rr->ptrdname);
-  } elsif ($rr->type eq 'SRV') {
+  } elsif ($type eq 'PTR') {
+    my $address = name2ip $rr->name;
+    $add_ptr->execute($rr->name, $zoneid, $rr->ttl, $address, $rr->ptrdname);
+  } elsif ($type eq 'SRV') {
     $add_srv->execute($rr->name, $zoneid, $rr->ttl, $rr->priority, $rr->weight, $rr->port, $rr->target);
-  } elsif ($rr->type eq 'TXT') {
+  } elsif ($type eq 'TXT') {
     $add_txt->execute($rr->name, $zoneid, $rr->ttl, $rr->txtdata);
   } else {
     # just ignore other types (including SOA) -- should probably raise an error somewhere
@@ -566,7 +590,8 @@ sub del_rr {
   } elsif ($rr->type eq 'NS') {
     $del_ns->execute($rr->name, $zoneid, $rr->ttl, $rr->nsdname);
   } elsif ($rr->type eq 'PTR') {
-    $del_ptr->execute($rr->name, $zoneid, $rr->ttl, $rr->address, $rr->ptrdname);
+    my $address = name2ip $rr->name;
+    $del_ptr->execute($rr->name, $zoneid, $rr->ttl, $address, $rr->ptrdname);
   } elsif ($rr->type eq 'SOA') {
     $del_soa->execute($zoneid,
                       $rr->ttl,
@@ -598,42 +623,62 @@ sub del_rr {
 sub replace_rr {
   my $zoneid = shift;
   my $rr = shift;
-print Dumper(\$rr);
+  print "replace rr: ", Dumper(\$rr), "\n" if $verbose;
 
   if ($rr->type eq 'A') {
-    $del_a->execute($rr->name, $zoneid, $rr->ttl, $rr->address);
+    print "Updating A record\n" if $verbose;
+    if(0 == $keep_a->execute($rr->name, $zoneid, $rr->ttl, $rr->address)) {
+      print "Adding new A record -- didn't already exist\n" if $verbose;
+      $add_a->execute($rr->name, $zoneid, $rr->ttl, $rr->address);
+    }
   } elsif ($rr->type eq 'CNAME') {
-    $del_cname->execute($rr->name, $zoneid, $rr->ttl, $rr->cname);
+    if(0 == $keep_cname->execute($rr->name, $zoneid, $rr->ttl, $rr->cname)) {
+      $add_cname->execute($rr->name, $zoneid, $rr->ttl, $rr->cname);
+    }
   } elsif ($rr->type eq 'MX') {
-    $del_a->execute($rr->name, $zoneid, $rr->ttl, $rr->exchange, $rr->preference);
+    if(0 == $keep_mx->execute($rr->name, $zoneid, $rr->ttl, $rr->exchange, $rr->preference)) {
+      $add_mx->execute($rr->name, $zoneid, $rr->ttl, $rr->exchange, $rr->preference);
+    }
   } elsif ($rr->type eq 'NS') {
-    $del_ns->execute($rr->name, $zoneid, $rr->ttl, $rr->nsdname);
+    if(0 == $keep_ns->execute($rr->name, $zoneid, $rr->ttl, $rr->nsdname)) {
+      $add_ns->execute($rr->name, $zoneid, $rr->ttl, $rr->nsdname);
+    }
   } elsif ($rr->type eq 'PTR') {
-    $del_ptr->execute($rr->name, $zoneid, $rr->ttl, $rr->address, $rr->ptrdname);
+    my $address = name2ip $rr->name;
+print "Address: $address\n";
+    if(0 == $keep_ptr->execute($rr->name, $zoneid, $rr->ttl, $address, $rr->ptrdname)) {
+      $add_ptr->execute($rr->name, $zoneid, $rr->ttl, $address, $rr->ptrdname);
+    }
   } elsif ($rr->type eq 'SRV') {
-    $del_srv->execute($rr->name, $zoneid, $rr->ttl, $rr->priority, $rr->weight, $rr->port, $rr->target);
+    if(0 == $keep_srv->execute($rr->name, $zoneid, $rr->ttl, $rr->priority, $rr->weight, $rr->port, $rr->target)) {
+      $add_srv->execute($rr->name, $zoneid, $rr->ttl, $rr->priority, $rr->weight, $rr->port, $rr->target);
+    }
   } elsif ($rr->type eq 'TXT') {
-    $del_txt->execute($rr->name, $zoneid, $rr->ttl, $rr->txtdata);
+    if(0 == $keep_txt->execute($rr->name, $zoneid, $rr->ttl, $rr->txtdata)) {
+      $add_txt->execute($rr->name, $zoneid, $rr->ttl, $rr->txtdata);
+    }
   } else {
     # just ignore other types (including SOA) -- should probably raise an error somewhere
   }
 }
 
 sub update_soa {
-  my $zone = shift;
-  my $soa = shift;
-  my $dbh = shift;
+  my $zone   = shift;
+  my $zoneid = shift;
+  my $soa    = shift;
+  my $dbh    = shift;
 
   my $sth = $dbh->prepare("UPDATE dns_soa
                            SET    deleted = now()
                            WHERE  zone    = ?
                              AND  deleted IS NULL
                           ");
-  $sth->execute($zone);
-  $sth= $dbh->prepare("INSERT INTO dns_soa (zone, ttl, mname, rname, serial, refresh, retry, expire, minimum)
-                       VALUES              (?,    ?,   ?,     ?,     ?,      ?,       ?,     ?,      ?      )
+  $sth->execute($zoneid);
+  $sth= $dbh->prepare("INSERT INTO dns_soa (zone, name, ttl, mname, rname, serial, refresh, retry, expire, minimum)
+                       VALUES              (?,    ?,    ?,   ?,     ?,     ?,      ?,       ?,     ?,      ?      )
                       ");
-  $sth->execute($zone,
+  $sth->execute($zoneid,
+                $zone,
                 $soa->ttl,
                 $soa->mname,
                 $soa->rname,
