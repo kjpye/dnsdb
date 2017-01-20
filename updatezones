@@ -109,10 +109,13 @@ sub get_viewid {
  
   print "View: \"$view\"\n" if $verbose;
 
+# This would be nice, but requires Postgresql 9.5
+#
 #  my $sth = $dbh->prepare("INSERT INTO view (name)
 #                           VALUES (?)
 #                           ON CONFLICT DO NOTHING
 #                           RETURNING viewid");
+
   my $sth = $dbh->prepare("SELECT viewid
                            FROM   view
                            WHERE  name = ?

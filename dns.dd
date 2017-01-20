@@ -1,8 +1,10 @@
 -- Data definition for information about dns zones
 
+create sequence view_id;
+
 create table view (
-  viewid int primary key,
-  name text
+  viewid int primary key default nextval('zone_id'),
+  name text unique
 );
 
 insert into view (viewid, name) values (-1, 'unknown');
