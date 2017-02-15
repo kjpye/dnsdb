@@ -15,7 +15,7 @@ use Net::DNS::RR::SOA;
 use Data::Dumper;
 
 my $verbose = 0;
-#$verbose = 1; # uncomment for debugging
+$verbose = 1; # uncomment for debugging
 
 my $hasixfr = 0;
 my $hasiterator = 0;
@@ -30,8 +30,24 @@ if($#ARGV >= 0) {
   for my $arg (@ARGV) {
     my ($zone, $view) = split ':', $arg;
     $view //= 'unknown';
-    $zone =~ s/\.*$/./;
-    update_zone("$zone $view");
+    if ($zone eq 'all') {
+      my $dbh = DBI->connect("dbi:Pg:dbname=$db", '', '', {AutoCommit => 0});
+      my $sth = $dbh->prepare("SELECT zone.name, view.name
+                               FROM zone, view
+                               WHERE zone.view = view.viewid
+                                 AND zone.deleted IS NULL
+                              ");
+      $sth->execute();
+      while(my @row = $sth->fetchrow_array()) {
+        my ($zone, $view) = @row;
+        print "$zone $view\n";
+        update_zone("$zone $view");
+      }
+      $dbh->disconnect;
+    } else {
+      $zone =~ s/\.*$/./;
+      update_zone("$zone $view");
+    }
   }
   exit 0;
 }
@@ -258,7 +274,7 @@ sub update_existing_zone {
 
 # Make an AXFR/IXFR query
   print "Creating new resolver for $mname\n" if $verbose;
-$mname = 'p03205.internal.vic.gov.au';
+#$mname = 'p03205.internal.vic.gov.au';
   my $resolver = new Net::DNS::Resolver(nameservers => [ $mname ] );
   #$resolver->tsig("$keydir/$view.key");
   my $nextrr;
@@ -275,6 +291,10 @@ $mname = 'p03205.internal.vic.gov.au';
   #my $qry = $resolver->query($zone, 'IXFR', $soa); # FIX
   #my $iterator = $resolver->axfr($zone, 'IN');
   my @rrs = $resolver->axfr($zone, 'IN');
+  if (scalar @rrs < 1) {
+    print $resolver->errorstring(), "\n";
+    return;
+  }
 # Run through each returned RR processing it
   my $state = 0;
   #my $newsoa = &$iterator();
@@ -542,11 +562,11 @@ sub delete_entries {
 
 sub name2ip {
   my $name = shift;
-print "name2ip: $name\n";
+#print "name2ip: $name\n";
   $name =~ s/\.in-addr.arpa//i;
-print "name2ip: $name\n";
+#print "name2ip: $name\n";
   my @octets = split /\./, $name;
-print Dumper(\@octets), "\n";
+#print Dumper(\@octets), "\n";
   join '.', reverse @octets;
 }
 
@@ -648,7 +668,7 @@ sub replace_rr {
     }
   } elsif ($rr->type eq 'PTR') {
     my $address = name2ip $rr->name;
-print "Address: $address\n";
+#print "Address: $address\n";
     if(0 == $keep_ptr->execute($rr->name, $zoneid, $rr->ttl, $address, $rr->ptrdname)) {
       $add_ptr->execute($rr->name, $zoneid, $rr->ttl, $address, $rr->ptrdname);
     }
