@@ -258,7 +258,7 @@ sub update_existing_zone {
 
 # Make an AXFR/IXFR query
   print "Creating new resolver for $mname\n" if $verbose;
-$mname = 'linux-c567.internal.vic.gov.au';
+$mname = 'p03205.internal.vic.gov.au';
   my $resolver = new Net::DNS::Resolver(nameservers => [ $mname ] );
   #$resolver->tsig("$keydir/$view.key");
   my $nextrr;
