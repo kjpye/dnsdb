@@ -11,6 +11,7 @@ use Net::DNS;
 use Net::DNS::Nameserver;
 use Net::DNS::Resolver;
 use Net::DNS::RR::SOA;
+use Net::DNS::RR::TSIG;
 
 use Data::Dumper;
 
@@ -31,19 +32,24 @@ if($#ARGV >= 0) {
     my ($zone, $view) = split ':', $arg;
     $view //= 'unknown';
     if ($zone eq 'all') {
+      my @zones;
       my $dbh = DBI->connect("dbi:Pg:dbname=$db", '', '', {AutoCommit => 0});
       my $sth = $dbh->prepare("SELECT zone.name, view.name
                                FROM zone, view
                                WHERE zone.view = view.viewid
                                  AND zone.deleted IS NULL
+                               ORDER BY zone.name, view.name;
                               ");
       $sth->execute();
       while(my @row = $sth->fetchrow_array()) {
         my ($zone, $view) = @row;
-        print "$zone $view\n";
-        update_zone("$zone $view");
+        push @zones, "$zone $view";
       }
       $dbh->disconnect;
+      for my $zone (@zones) {
+        print $zone, "\n";
+        update_zone($zone);
+      }
     } else {
       $zone =~ s/\.*$/./;
       update_zone("$zone $view");
@@ -273,10 +279,27 @@ sub update_existing_zone {
   my $soa = new Net::DNS::RR("$zone SOA z x.y $serial 1 1 1 1");
 
 # Make an AXFR/IXFR query
+$mname = '10.112.138.214';
   print "Creating new resolver for $mname\n" if $verbose;
-#$mname = 'p03205.internal.vic.gov.au';
   my $resolver = new Net::DNS::Resolver(nameservers => [ $mname ] );
-  #$resolver->tsig("$keydir/$view.key");
+  my $key = 'yA169e32jTDIYFmZwfa6pw==';
+  #my $tsig = Net::DNS::RR->new("master.key. TSIG $key");
+  #my $tsig = Net::DNS::RR->new(name => 'master.key',
+  #                             type => 'TSIG',
+  #                             key  => '/home/kevinp/tmp/key.master'
+  #                            );
+  my $tsig = create Net::DNS::RR::TSIG('/home/kevinp/tmp/key.master');
+  print Dumper(\$tsig);
+  my $resp = $resolver->tsig($tsig);
+  my $packet = $resolver->query($zone, 'SOA');
+  print Dumper(\$packet);
+  if (defined $packet) {
+    my @answer = $packet->answer;
+    if (@answer and $answer[0]->type eq 'SOA' and $answer[0]->serial == $serial) {
+      print "Zone $zone is up to date\n";
+      return;
+    }
+  }
   my $nextrr;
   if ($hasiterator) {
     if ($hasixfr) {
