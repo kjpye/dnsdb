@@ -23,6 +23,9 @@ my $hasiterator = 0;
 
 my $keydir = '/etc/named.d';
 
+# The list of record types we want to keep in the database.
+#   Don't mention SOA records here; they're treated specially.
+
 my @RRtypes = qw(a cname mx ns ptr srv txt);
 
 my $db = 'dns2';
@@ -104,19 +107,19 @@ if ($childid) { # parent process -- wait for notify and send details to child
                  NotifyHandler => \&notify_handler,
                  Verbose       => 1,
                ) or die "Couldn't create name server object\n";
-# Drop privilege
+# Drop privilege (should be configurable)
   $UID = 1000;
   $GID = 100;
   $ns->main_loop;
   close $writepipe;
 } else { # child process -- perform zone transfers and update database
   close $writepipe;
-# Drop privilege
+# Drop privilege (configurable?)
   $UID = $EUID = 1000;
   $GID = $EGID = 100;
   while(my $zone = <$readpipe>) {
     chomp $zone;
-    $zone =~ s/\.*$/./;
+    $zone =~ s/\.*$/./; # Canonicalise zone name
     update_zone($zone);
   }
   close $readpipe;
@@ -149,12 +152,13 @@ sub get_viewid {
   $viewid;
 }
 
+# This is where all the real work is done
+
 sub update_zone {
   my $args = shift;
   print "Args: \"$args\"\n" if $verbose;
   my ($zone, $view) = split ' ', $args;
-  $zone =~ s/\.*$//;
-  $zone .= '.'; # force trailing dot
+  $zone =~ s/\.*$/./; # Canonicalise again!
   $view //= 'unknown';
   $view =~ s/\.*$//; # remove any trailing dots
 
@@ -563,7 +567,7 @@ sub set_delete {
                                AND deleted IS NULL
                             ");
      $sth->execute($zone);
-$dbh->commit();
+$dbh->commit(); # temporary only
   }
 }
 
