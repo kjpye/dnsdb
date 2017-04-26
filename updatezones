@@ -21,7 +21,7 @@ $verbose = 1; # uncomment for debugging
 my $hasixfr = 0;
 my $hasiterator = 0;
 
-my $keydir = '/etc/named.d';
+my $keydir = '/etc/named.d/keys';
 
 # The list of record types we want to keep in the database.
 #   Don't mention SOA records here; they're treated specially.
@@ -156,7 +156,7 @@ sub get_viewid {
 
 sub update_zone {
   my $args = shift;
-  print "Args: \"$args\"\n" if $verbose;
+  print "update_zone - args: \"$args\"\n" if $verbose;
   my ($zone, $view) = split ' ', $args;
   $zone =~ s/\.*$/./; # Canonicalise again!
   $view //= 'unknown';
@@ -180,8 +180,10 @@ sub update_zone {
   }
 
   if ( ! $zoneid ) { # zone isn't in database yet
+print "Couldn't find zone id for view $view of $zone\n";
     populate_new_zone($zone, $view, $dbh);
   } else {
+print "zoneid is $zoneid\n";
     update_existing_zone($zone, $view, $zoneid, $dbh);
   }
 
@@ -205,6 +207,7 @@ sub populate_new_zone {
 
 # Get the view id, making sure it exists
   my $viewid = get_viewid ($view, $dbh);
+print "viewid: $viewid\n";
 
 # create entry in zone table; won't contain a lot yet, but we need the zone id
   my $sth = $dbh->prepare("INSERT INTO zone (name, view)
@@ -215,12 +218,14 @@ sub populate_new_zone {
   while (my @row = $sth->fetchrow_array()) {
     $zoneid = $row[0];
   }
+print "zoneid: $zoneid\n";
 
 # fetch data and update tables
   my $soa = undef;
-  my $res = new Net::DNS::Resolver(nameservers => ['linux-c567.internal.vic.gov.au.']) or die "Could not create resolver\n";
+  my $res = new Net::DNS::Resolver(nameservers => ['10.112.138.240']) or die "Could not create resolver\n";
   prepare_db($dbh);
-  #$res->tsig("$keydir/$view.key");
+  my $tsig = create Net::DNS::RR::TSIG("$keydir/$view.key");
+  $res->tsig($tsig);
   my $nextrr;
   if ($hasiterator) {
     $nextrr = $res->axfr($zone);
@@ -283,22 +288,24 @@ sub update_existing_zone {
   my $soa = new Net::DNS::RR("$zone SOA z x.y $serial 1 1 1 1");
 
 # Make an AXFR/IXFR query
-$mname = '10.112.138.214';
+$mname = '10.112.138.240';
   print "Creating new resolver for $mname\n" if $verbose;
   my $resolver = new Net::DNS::Resolver(nameservers => [ $mname ] );
-  my $key = 'yA169e32jTDIYFmZwfa6pw==';
+  #my $key = 'yA169e32jTDIYFmZwfa6pw==';
   #my $tsig = Net::DNS::RR->new("master.key. TSIG $key");
   #my $tsig = Net::DNS::RR->new(name => 'master.key',
   #                             type => 'TSIG',
   #                             key  => '/home/kevinp/tmp/key.master'
   #                            );
-  my $tsig = create Net::DNS::RR::TSIG('/home/kevinp/tmp/key.master');
-  print Dumper(\$tsig);
+  my $tsig = create Net::DNS::RR::TSIG("$keydir/$view.key");
+#  print Dumper(\$tsig);
   my $resp = $resolver->tsig($tsig);
+#print "TSIG respone: $resp\n";
   my $packet = $resolver->query($zone, 'SOA');
-  print Dumper(\$packet);
+#  print Dumper(\$packet);
   if (defined $packet) {
     my @answer = $packet->answer;
+print 'Current serial number is ' . $answer[0]->serial . "\n";
     if (@answer and $answer[0]->type eq 'SOA' and $answer[0]->serial == $serial) {
       print "Zone $zone is up to date\n";
       return;
@@ -309,14 +316,17 @@ $mname = '10.112.138.214';
     if ($hasixfr) {
 ###TODO
     } else {
-      $nextrr = $resolver->axfr($zone);
+      #$nextrr = $resolver->axfr($zone);
     }
   } else {
-    my @rrs = $resolver->axfr($zone);
-    $nextrr = make_iterator(@rrs);
+#    my @rrs = $resolver->axfr($zone);
+#    $nextrr = make_iterator(@rrs);
   }
   #my $qry = $resolver->query($zone, 'IXFR', $soa); # FIX
   #my $iterator = $resolver->axfr($zone, 'IN');
+print "Fetching zone\n";
+  $tsig = create Net::DNS::RR::TSIG("$keydir/$view.key");
+  $resolver->tsig($tsig);
   my @rrs = $resolver->axfr($zone, 'IN');
   if (scalar @rrs < 1) {
     print $resolver->errorstring(), "\n";
