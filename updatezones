@@ -69,7 +69,6 @@ sub query_handler {
   my ($rcode, @ans, @auth, @add);
 
   print "Received query from $peerhost to ". $conn->{sockhost}. "\n";
-  $query->print;
 
   return ('NOTIMP', \@ans, \@auth, \@add);
 }
@@ -100,7 +99,6 @@ if ($childid) { # parent process -- wait for notify and send details to child
   my $ofh = select $writepipe;
   $| = 1;
   select $ofh;
-  #print $writepipe "parent here:\n";
   my $ns = new Net::DNS::Nameserver(
                  LocalPort     => 53,
                  ReplyHandler  => \&query_handler,
@@ -180,10 +178,8 @@ sub update_zone {
   }
 
   if ( ! $zoneid ) { # zone isn't in database yet
-print "Couldn't find zone id for view $view of $zone\n";
     populate_new_zone($zone, $view, $dbh);
   } else {
-print "zoneid is $zoneid\n";
     update_existing_zone($zone, $view, $zoneid, $dbh);
   }
 
@@ -193,7 +189,6 @@ print "zoneid is $zoneid\n";
 sub make_iterator {
   my @rrs = @_;
   print "RRs are ", Dumper(\@rrs), "\n" if $verbose;
-  print scalar @rrs, " RRs\n";
   return sub { shift @rrs; };
 }
 
@@ -207,7 +202,6 @@ sub populate_new_zone {
 
 # Get the view id, making sure it exists
   my $viewid = get_viewid ($view, $dbh);
-print "viewid: $viewid\n";
 
 # create entry in zone table; won't contain a lot yet, but we need the zone id
   my $sth = $dbh->prepare("INSERT INTO zone (name, view)
@@ -218,7 +212,6 @@ print "viewid: $viewid\n";
   while (my @row = $sth->fetchrow_array()) {
     $zoneid = $row[0];
   }
-print "zoneid: $zoneid\n";
 
 # fetch data and update tables
   my $soa = undef;
@@ -291,93 +284,79 @@ sub update_existing_zone {
 $mname = '10.112.138.240';
   print "Creating new resolver for $mname\n" if $verbose;
   my $resolver = new Net::DNS::Resolver(nameservers => [ $mname ] );
-  #my $key = 'yA169e32jTDIYFmZwfa6pw==';
-  #my $tsig = Net::DNS::RR->new("master.key. TSIG $key");
-  #my $tsig = Net::DNS::RR->new(name => 'master.key',
-  #                             type => 'TSIG',
-  #                             key  => '/home/kevinp/tmp/key.master'
-  #                            );
   my $tsig = create Net::DNS::RR::TSIG("$keydir/$view.key");
-#  print Dumper(\$tsig);
   my $resp = $resolver->tsig($tsig);
-#print "TSIG respone: $resp\n";
   my $packet = $resolver->query($zone, 'SOA');
-#  print Dumper(\$packet);
   if (defined $packet) {
     my @answer = $packet->answer;
-print 'Current serial number is ' . $answer[0]->serial . "\n";
-    if (@answer and $answer[0]->type eq 'SOA' and $answer[0]->serial == $serial) {
-      print "Zone $zone is up to date\n";
-      return;
-    }
-  }
-  my $nextrr;
-  if ($hasiterator) {
-    if ($hasixfr) {
+    if (@answer and $answer[0]->type eq 'SOA') {
+      if ($answer[0]->serial == $serial) {
+        print "Zone $zone is up to date\n" if $verbose;
+        return;
+      }
+      my $nextrr;
+      if ($hasiterator) {
+        if ($hasixfr) {
 ###TODO
-    } else {
-      #$nextrr = $resolver->axfr($zone);
-    }
-  } else {
-#    my @rrs = $resolver->axfr($zone);
-#    $nextrr = make_iterator(@rrs);
-  }
-  #my $qry = $resolver->query($zone, 'IXFR', $soa); # FIX
-  #my $iterator = $resolver->axfr($zone, 'IN');
-print "Fetching zone\n";
-  $tsig = create Net::DNS::RR::TSIG("$keydir/$view.key");
-  $resolver->tsig($tsig);
-  my @rrs = $resolver->axfr($zone, 'IN');
-  if (scalar @rrs < 1) {
-    print $resolver->errorstring(), "\n";
-    return;
-  }
-# Run through each returned RR processing it
-  my $state = 0;
-  #my $newsoa = &$iterator();
-  print "RRs read: ", Dumper(\@rrs), "\n" if $verbose;
-  my $newsoa = shift @rrs;
-  print "New SOA: :", Dumper(\$newsoa), "\n" if $verbose;
-  #my $newserial = $newsoa->serial;
-  #if ($newserial != $serial) {
-    prepare_db($dbh); # set up all the DB queries
-  #  while (my $rr = &$iterator()) {
-    for my $rr (@rrs) {
-      print "Handling RR: ", Dumper(\$rr), "\n" if $verbose;
-      if ($rr->type eq 'SOA') {
-        if ($state == 0) { # initial state -- this is an IXFR transfer
-          $state = 2;
-        } elsif ($state == 1) { # AXFR -- there shouldn't be an SOA here
-        } elsif ($state == 2) { # adding -- new state is deleting
-          $state = 3;
-        } elsif ($state == 3) { # deleting -- new state is adding
-          $state = 2;
         } else {
+          #$nextrr = $resolver->axfr($zone);
         }
       } else {
-        if ($state == 0) { # must be axfr -- process whole zone
-          $state = 1;
-          set_delete($zoneid, $dbh);
-          replace_rr($zoneid, $rr);
-        } elsif ($state == 1) { # doing axfr -- treat specially
-          replace_rr($zoneid, $rr);
-        } elsif ($state == 2) { # deleting
-          del_rr($rr);
-        } elsif ($state == 3) { # adding
-          add_rr($rr);
-        } else { # illegal state
-        }
+#    my @rrs = $resolver->axfr($zone);
+#    $nextrr = make_iterator(@rrs);
       }
-    }
-  #}
-  print "Deleting old entries\n" if $verbose;
-  delete_entries($zoneid, $dbh) if $state == 1;
+      #my $qry = $resolver->query($zone, 'IXFR', $soa); # FIX
+      #my $iterator = $resolver->axfr($zone, 'IN');
+      $tsig = create Net::DNS::RR::TSIG("$keydir/$view.key");
+      $resolver->tsig($tsig);
+      my @rrs = $resolver->axfr($zone, 'IN');
+      if (scalar @rrs < 1) {
+        print $resolver->errorstring(), "\n";
+        return;
+      }
+# Run through each returned RR processing it
+      my $state = 0;
+      print "RRs read: ", Dumper(\@rrs), "\n" if $verbose;
+      my $newsoa = shift @rrs;
+      print "New SOA: :", Dumper(\$newsoa), "\n" if $verbose;
+        prepare_db($dbh); # set up all the DB queries
+        for my $rr (@rrs) {
+          print "Handling RR: ", Dumper(\$rr), "\n" if $verbose;
+          if ($rr->type eq 'SOA') {
+            if ($state == 0) { # initial state -- this is an IXFR transfer
+              $state = 2;
+            } elsif ($state == 1) { # AXFR -- there shouldn't be an SOA here
+            } elsif ($state == 2) { # adding -- new state is deleting
+              $state = 3;
+            } elsif ($state == 3) { # deleting -- new state is adding
+              $state = 2;
+            } else {
+            }
+          } else {
+            if ($state == 0) { # must be axfr -- process whole zone
+              $state = 1;
+              set_delete($zoneid, $dbh);
+              replace_rr($zoneid, $rr);
+            } elsif ($state == 1) { # doing axfr -- treat specially
+              replace_rr($zoneid, $rr);
+            } elsif ($state == 2) { # deleting
+              del_rr($rr);
+            } elsif ($state == 3) { # adding
+              add_rr($rr);
+            } else { # illegal state
+            }
+          }
+        }
+      print "Deleting old entries\n" if $verbose;
+      delete_entries($zoneid, $dbh) if $state == 1;
 
 # add the new soa RR
-  update_soa($zone, $zoneid, $newsoa, $dbh);
+      update_soa($zone, $zoneid, $newsoa, $dbh);
 
 # Now commit the data so it's visible
-  $dbh->commit();
+      $dbh->commit();
+    }
+  }
 }
 
 my $add_a;
@@ -599,11 +578,8 @@ sub delete_entries {
 
 sub name2ip {
   my $name = shift;
-#print "name2ip: $name\n";
   $name =~ s/\.in-addr.arpa//i;
-#print "name2ip: $name\n";
   my @octets = split /\./, $name;
-#print Dumper(\@octets), "\n";
   join '.', reverse @octets;
 }
 
@@ -705,7 +681,6 @@ sub replace_rr {
     }
   } elsif ($rr->type eq 'PTR') {
     my $address = name2ip $rr->name;
-#print "Address: $address\n";
     if(0 == $keep_ptr->execute($rr->name, $zoneid, $rr->ttl, $address, $rr->ptrdname)) {
       $add_ptr->execute($rr->name, $zoneid, $rr->ttl, $address, $rr->ptrdname);
     }
