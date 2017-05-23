@@ -5,8 +5,6 @@ use English;
 
 use DBI;
 
-#use lib '/home/kevinp/src/P5-Net-DNS/lib';
-
 use Net::DNS;
 use Net::DNS::Nameserver;
 use Net::DNS::Resolver;
@@ -17,6 +15,7 @@ use Data::Dumper;
 
 my $verbose = 0;
 $verbose = 1; # uncomment for debugging
+$verbose = 2; # uncomment to dump data structures as well
 
 my $hasixfr = 0;
 my $hasiterator = 0;
@@ -32,30 +31,32 @@ my $db = 'dns2';
 
 if($#ARGV >= 0) {
   for my $arg (@ARGV) {
-    my ($zone, $view) = split ':', $arg;
+    my ($server, $zone, $view) = split ':', $arg;
     $view //= 'unknown';
     if ($zone eq 'all') {
       my @zones;
       my $dbh = DBI->connect("dbi:Pg:dbname=$db", '', '', {AutoCommit => 0});
-      my $sth = $dbh->prepare("SELECT zone.name, view.name
-                               FROM zone, view
+      my $sth = $dbh->prepare("SELECT zone.name, view.name, server.address
+                               FROM zone, view, server
                                WHERE zone.view = view.viewid
                                  AND zone.deleted IS NULL
+                                 AND zone.serverid = zerver.serverid
                                ORDER BY zone.name, view.name;
                               ");
       $sth->execute();
       while(my @row = $sth->fetchrow_array()) {
-        my ($zone, $view) = @row;
-        push @zones, "$zone $view";
+        my ($zone, $view, $server) = @row;
+        push @zones, "$server:$zone:$view";
       }
       $dbh->disconnect;
-      for my $zone (@zones) {
-        print $zone, "\n";
-        update_zone($zone);
+      for my $z (@zones) {
+        print $z, "\n";
+        my ($server, $zone, $view) = split ':', $z;
+        update_zone($server, $view, $zone);
       }
     } else {
       $zone =~ s/\.*$/./;
-      update_zone("$zone $view");
+      update_zone($server, $view, $zone);
     }
   }
   exit 0;
@@ -68,23 +69,23 @@ sub query_handler {
   my ($qname, $qclass, $qtype, $peerhost,$query,$conn) = @_;
   my ($rcode, @ans, @auth, @add);
 
-  print "Received query from $peerhost to ". $conn->{sockhost}. "\n";
+  print STDERR "Received query from $peerhost to ". $conn->{sockhost}. "\n" if $verbose > 0;
 
   return ('NOTIMP', \@ans, \@auth, \@add);
 }
 
 sub notify_handler {
-  my ($qname, $qclass, $qtype, $peerhost,$query,$conn) = @_;
+  my ($qname, $qclass, $qtype, $peerhost, $query, $conn) = @_;
   my ($rcode, @ans, @auth, @add);
 
-  print "Received notify from $peerhost to ". $conn->{sockhost}. "\n" if $verbose;
-  $query->print if $verbose;
+  print STDERR "Received notify from $peerhost to ". $conn->{sockhost}. "\n" if $verbose > 0;
+  $query->print if $verbose > 1;
 
   my $view = 'unknown';
   for my $rr ($query->additional) {
     $view = $rr->name if $rr->type eq 'TSIG';
   }
-  print $writepipe "$qname $view\n";
+  print $writepipe "$peerhost:$qname:$view\n";
   $rcode = 'NOERROR';
 
   return ($rcode, \@ans, \@auth, \@add);
@@ -103,7 +104,7 @@ if ($childid) { # parent process -- wait for notify and send details to child
                  LocalPort     => 53,
                  ReplyHandler  => \&query_handler,
                  NotifyHandler => \&notify_handler,
-                 Verbose       => 1,
+                 Verbose       => $verbose,
                ) or die "Couldn't create name server object\n";
 # Drop privilege (should be configurable)
   $UID = 1000;
@@ -115,10 +116,10 @@ if ($childid) { # parent process -- wait for notify and send details to child
 # Drop privilege (configurable?)
   $UID = $EUID = 1000;
   $GID = $EGID = 100;
-  while(my $zone = <$readpipe>) {
-    chomp $zone;
-    $zone =~ s/\.*$/./; # Canonicalise zone name
-    update_zone($zone);
+  while (my $z = <$readpipe>) {
+    chomp $z;
+    my ($server, $zone, $view) = split ':', $z;
+    update_zone($server, $view, $zone);
   }
   close $readpipe;
 }
@@ -130,7 +131,7 @@ sub get_viewid {
 
   return 0 unless $view;
  
-  print "View: \"$view\"\n" if $verbose;
+  print "View: \"$view\"\n" if $verbose > 0;
 
 # This would be nice, but requires Postgresql 9.5
 #
@@ -150,12 +151,38 @@ sub get_viewid {
   $viewid;
 }
 
+sub get_serverid {
+  my $ip       = shift;
+  my $dbh      = shift;
+  my $serverid = 0;
+
+  return 0 unless $ip;
+ 
+  print "Server ip: \"$ip\"\n" if $verbose > 0;
+
+# This would be nice, but requires Postgresql 9.5
+#
+#  my $sth = $dbh->prepare("INSERT INTO server (ip)
+#                           VALUES (?)
+#                           ON CONFLICT DO NOTHING
+#                           RETURNING viewid");
+
+  my $sth = $dbh->prepare("SELECT serverid
+                           FROM   server
+                           WHERE  address = ?
+                          ");
+  $sth->execute($ip);
+  while(my @row = $sth->fetchrow_array()) {
+    $serverid = $row[0];
+  }
+  $serverid;
+}
+
 # This is where all the real work is done
 
 sub update_zone {
-  my $args = shift;
-  print "update_zone - args: \"$args\"\n" if $verbose;
-  my ($zone, $view) = split ' ', $args;
+  my ($server, $view, $zone) = @_;
+  print "update_zone - args: $server, $view, $zone\n" if $verbose > 0;
   $zone =~ s/\.*$/./; # Canonicalise again!
   $view //= 'unknown';
   $view =~ s/\.*$//; # remove any trailing dots
@@ -165,22 +192,24 @@ sub update_zone {
 
 # get zone information
   my $sth = $dbh->prepare("SELECT zoneid
-                           FROM   zone, view
+                           FROM   zone, view, server
                            WHERE  zone.name = ?
                              AND  view.name = ?
                              AND  zone.view = view.viewid
-                             AND  deleted IS NULL
+                             AND  zone.server = server.serverid
+                             AND  server.address = ?
+                             AND  zone.deleted IS NULL
                           ");
-  $sth->execute($zone, $view);
+  $sth->execute($zone, $view, $server);
   my $zoneid = 0;
   while (my @row = $sth->fetchrow_array()) {
     $zoneid = $row[0];
   }
 
   if ( ! $zoneid ) { # zone isn't in database yet
-    populate_new_zone($zone, $view, $dbh);
+    populate_new_zone($server, $zone, $view, $dbh);
   } else {
-    update_existing_zone($zone, $view, $zoneid, $dbh);
+    update_existing_zone($server, $zone, $view, $zoneid, $dbh);
   }
 
   $dbh->disconnect();
@@ -188,37 +217,45 @@ sub update_zone {
 
 sub make_iterator {
   my @rrs = @_;
-  print "RRs are ", Dumper(\@rrs), "\n" if $verbose;
+  print "RRs are ", Dumper(\@rrs), "\n" if $verbose > 1;
   return sub { shift @rrs; };
 }
 
 sub populate_new_zone {
-  my $zone = shift;
-  my $view = shift;
-  my $dbh = shift;
+  my $server = shift;
+  my $zone   = shift;
+  my $view   = shift;
+  my $dbh    = shift;
 
-  print "Populate '$zone'\n" if $verbose;
+  print "Populate '$zone' in view '$view' from server '$server'\n" if $verbose > 0;
   my $zoneid = 0;
+
+## Check sanity, creating entries as required
 
 # Get the view id, making sure it exists
   my $viewid = get_viewid ($view, $dbh);
 
-# create entry in zone table; won't contain a lot yet, but we need the zone id
-  my $sth = $dbh->prepare("INSERT INTO zone (name, view)
-                           VALUES      (?, ?)
+# Get server id, making sure it exists
+  my $serverid = get_serverid ($server, $dbh);
+
+# create entry in zone table
+  my $sth = $dbh->prepare("INSERT INTO zone (name, view, server)
+                           VALUES           (?,    ?,    ?     )
                            RETURNING   zoneid
                           ");
-  $sth->execute($zone, $viewid);
+  $sth->execute($zone, $viewid, $serverid);
   while (my @row = $sth->fetchrow_array()) {
     $zoneid = $row[0];
   }
 
 # fetch data and update tables
   my $soa = undef;
-  my $res = new Net::DNS::Resolver(nameservers => ['10.112.138.240']) or die "Could not create resolver\n";
+  my $res = new Net::DNS::Resolver(nameservers => [$server]) or die "Could not create resolver\n";
   prepare_db($dbh);
-  my $tsig = create Net::DNS::RR::TSIG("$keydir/$view.key");
-  $res->tsig($tsig);
+  if ($view ne 'unknown') {
+    my $tsig = create Net::DNS::RR::TSIG("$keydir/$view.key");
+    $res->tsig($tsig);
+  }
   my $nextrr;
   if ($hasiterator) {
     $nextrr = $res->axfr($zone);
@@ -227,13 +264,13 @@ sub populate_new_zone {
     $nextrr = make_iterator(@rrs);
   }
   $soa = $nextrr->();
-  print "Initial SOA: ", Dumper(\$soa), "\n" if $verbose;
+  print "Initial SOA: ", Dumper(\$soa), "\n" if $verbose > 0;
   while(my $rr = $nextrr->()) {
     add_rr($zoneid, $rr);
   }
 
 # update zone table with new zone
-  print "Updating soa\n" if $verbose;
+  print "Updating soa\n" if $verbose > 0;
   if (defined $soa) {
     $sth = $dbh->prepare("INSERT INTO dns_soa (zone, name, ttl, mname, rname, serial, refresh, retry, expire, minimum)
                           VALUES              (?,    ?,    ?,   ?,     ?,     ?,      ?,       ?,     ?,      ?      )
@@ -252,38 +289,36 @@ sub populate_new_zone {
   }
 
 # Now commit the data so it's visible
-  print "Committing data\n" if $verbose;
+  print "Committing data\n" if $verbose > 0;
   $dbh->commit();
 }
 
 sub update_existing_zone {
-  my $zone = shift;
-  my $view = shift;
+  my $server = shift;
+  my $zone   = shift;
+  my $view   = shift;
   my $zoneid = shift;
-  my $dbh = shift;
+  my $dbh    = shift;
 
-  print "Updating '$zone' ($view, $zoneid)\n" if $verbose;
+  print "Updating '$zone' ($server, $view, $zoneid)\n" if $verbose > 0;
 # Get the existing SOA as an object
-  my $sth = $dbh->prepare("SELECT mname, serial
+  my $sth = $dbh->prepare("SELECT serial
                            FROM dns_soa
                            WHERE  zone = ?
                              AND  deleted IS NULL
                           ");
   $sth->execute($zoneid);
-  my $mname = 'x';
   my $serial = 0;
   while(my @row = $sth->fetchrow_array()) {
-    $mname = $row[0];
-    $serial = $row[1];
+    $serial = $row[0];
   }
-  print "Old serial number: ", $serial, "\n" if $verbose;
+  print "Old serial number: ", $serial, "\n" if $verbose > 0;
 # Create an SOA RR with the old serial number we can attach to an IXFR query
   my $soa = new Net::DNS::RR("$zone SOA z x.y $serial 1 1 1 1");
 
 # Make an AXFR/IXFR query
-$mname = '10.112.138.240';
-  print "Creating new resolver for $mname\n" if $verbose;
-  my $resolver = new Net::DNS::Resolver(nameservers => [ $mname ] );
+  print "Creating new resolver for $server\n" if $verbose > 0;
+  my $resolver = new Net::DNS::Resolver(nameservers => [ $server ] );
   my $tsig = create Net::DNS::RR::TSIG("$keydir/$view.key");
   my $resp = $resolver->tsig($tsig);
   my $packet = $resolver->query($zone, 'SOA');
@@ -291,24 +326,26 @@ $mname = '10.112.138.240';
     my @answer = $packet->answer;
     if (@answer and $answer[0]->type eq 'SOA') {
       if ($answer[0]->serial == $serial) {
-        print "Zone $zone is up to date\n" if $verbose;
+        print "Zone $zone is up to date\n" if $verbose > 0;
         return;
       }
       my $nextrr;
-      if ($hasiterator) {
-        if ($hasixfr) {
-###TODO
-        } else {
-          #$nextrr = $resolver->axfr($zone);
-        }
-      } else {
-#    my @rrs = $resolver->axfr($zone);
-#    $nextrr = make_iterator(@rrs);
+#      if ($hasiterator) {
+#        if ($hasixfr) {
+####TODO
+#        } else {
+#          #$nextrr = $resolver->axfr($zone);
+#        }
+#      } else {
+##    my @rrs = $resolver->axfr($zone);
+##    $nextrr = make_iterator(@rrs);
+#      }
+#      #my $qry = $resolver->query($zone, 'IXFR', $soa); # FIX
+#      #my $iterator = $resolver->axfr($zone, 'IN');
+      if ($view ne 'unknown') {
+        $tsig = create Net::DNS::RR::TSIG("$keydir/$view.key");
+        $resolver->tsig($tsig);
       }
-      #my $qry = $resolver->query($zone, 'IXFR', $soa); # FIX
-      #my $iterator = $resolver->axfr($zone, 'IN');
-      $tsig = create Net::DNS::RR::TSIG("$keydir/$view.key");
-      $resolver->tsig($tsig);
       my @rrs = $resolver->axfr($zone, 'IN');
       if (scalar @rrs < 1) {
         print $resolver->errorstring(), "\n";
@@ -316,12 +353,12 @@ $mname = '10.112.138.240';
       }
 # Run through each returned RR processing it
       my $state = 0;
-      print "RRs read: ", Dumper(\@rrs), "\n" if $verbose;
+      print "RRs read: ", Dumper(\@rrs), "\n" if $verbose > 1;
       my $newsoa = shift @rrs;
-      print "New SOA: :", Dumper(\$newsoa), "\n" if $verbose;
+      print "New SOA: :", Dumper(\$newsoa), "\n" if $verbose > 1;
         prepare_db($dbh); # set up all the DB queries
         for my $rr (@rrs) {
-          print "Handling RR: ", Dumper(\$rr), "\n" if $verbose;
+          print "Handling RR: ", Dumper(\$rr), "\n" if $verbose > 1;
           if ($rr->type eq 'SOA') {
             if ($state == 0) { # initial state -- this is an IXFR transfer
               $state = 2;
@@ -347,7 +384,7 @@ $mname = '10.112.138.240';
             }
           }
         }
-      print "Deleting old entries\n" if $verbose;
+      print "Deleting old entries\n" if $verbose > 0;
       delete_entries($zoneid, $dbh) if $state == 1;
 
 # add the new soa RR
@@ -578,8 +615,13 @@ sub delete_entries {
 
 sub name2ip {
   my $name = shift;
+  return '0.0.0.0' unless $name =~ /^\d+\.\d+\.\d+\.\d+\.in-addr\.arpa/i;
   $name =~ s/\.in-addr.arpa//i;
   my @octets = split /\./, $name;
+  return '0.0.0.0' if $octets[0] > 255;
+  return '0.0.0.0' if $octets[1] > 255;
+  return '0.0.0.0' if $octets[2] > 255;
+  return '0.0.0.0' if $octets[3] > 255;
   join '.', reverse @octets;
 }
 
@@ -590,7 +632,7 @@ sub add_rr {
   my $rr = shift;
 
   my $type = $rr->type;
-  print "add rr ($type): ", Dumper(\$rr), "\n"; # if $verbose;
+  print "add rr ($type): ", Dumper(\$rr), "\n" if $verbose > 1;
   if ($type eq 'A') {
     $add_a->execute($rr->name, $zoneid, $rr->ttl, $rr->address);
   } elsif ($type eq 'CNAME') {
@@ -659,12 +701,12 @@ sub del_rr {
 sub replace_rr {
   my $zoneid = shift;
   my $rr = shift;
-  print "replace rr: ", Dumper(\$rr), "\n" if $verbose;
+  print "replace rr: ", Dumper(\$rr), "\n" if $verbose > 1;
 
   if ($rr->type eq 'A') {
-    print "Updating A record\n" if $verbose;
+    print "Updating A record\n" if $verbose > 0;
     if(0 == $keep_a->execute($rr->name, $zoneid, $rr->ttl, $rr->address)) {
-      print "Adding new A record -- didn't already exist\n" if $verbose;
+      print "Adding new A record -- didn't already exist\n" if $verbose > 0;
       $add_a->execute($rr->name, $zoneid, $rr->ttl, $rr->address);
     }
   } elsif ($rr->type eq 'CNAME') {
