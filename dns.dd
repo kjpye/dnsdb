@@ -7,13 +7,6 @@ create table view (
   name text unique
 );
 
-insert into view (viewid, name) values (-1, 'unknown');
-insert into view (viewid, name) values ( 0, '');
-insert into view (viewid, name) values ( 1, 'master');
-insert into view (viewid, name) values ( 2, 'internal');
-insert into view (viewid, name) values ( 3, 'dhhs');
-insert into view (viewid, name) values ( 4, 'ahe');
-
 create sequence server_id;
 
 create table server (
@@ -23,8 +16,6 @@ create table server (
   created      timestamp default now(),
   deleted      timestamp
 );
-
-insert into server (name, address) values ('vm2', '10.112.138.240');
 
 create sequence zone_id;
 

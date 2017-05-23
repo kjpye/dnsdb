@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+db="dns2"
+
+dropdb $db
+createdb $db
+psql $db -f dns.dd
+
+insert into view (viewid, name) values (-1, 'unknown');
+insert into view (viewid, name) values ( 0, '');
+insert into view (viewid, name) values ( 1, 'master');
+insert into view (viewid, name) values ( 2, 'internal');
+insert into view (viewid, name) values ( 3, 'dhhs');
+insert into view (viewid, name) values ( 4, 'ahe');
+
+insert into server (name, address) values ('vm2', '10.112.138.240');
