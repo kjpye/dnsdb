@@ -13,6 +13,12 @@ use Net::DNS::RR::TSIG;
 
 use Data::Dumper;
 
+### Configuration section
+
+my $runasuid = 1000; # kevinp
+my $runasgid = 100;  # users
+
+### End configuration
 my $verbose = 0;
 $verbose = 1; # uncomment for debugging
 $verbose = 2; # uncomment to dump data structures as well
@@ -107,15 +113,15 @@ if ($childid) { # parent process -- wait for notify and send details to child
                  Verbose       => $verbose,
                ) or die "Couldn't create name server object\n";
 # Drop privilege (should be configurable)
-  $UID = 1000;
-  $GID = 100;
+  $UID = $#runasuid;
+  $GID = $#runasgid;
   $ns->main_loop;
   close $writepipe;
 } else { # child process -- perform zone transfers and update database
   close $writepipe;
 # Drop privilege (configurable?)
-  $UID = $EUID = 1000;
-  $GID = $EGID = 100;
+  $UID = $EUID = $runasuid;
+  $GID = $EGID = $runasgid;
   while (my $z = <$readpipe>) {
     chomp $z;
     my ($server, $zone, $view) = split ':', $z;
