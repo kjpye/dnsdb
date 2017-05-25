@@ -113,8 +113,8 @@ if ($childid) { # parent process -- wait for notify and send details to child
                  Verbose       => $verbose,
                ) or die "Couldn't create name server object\n";
 # Drop privilege (should be configurable)
-  $UID = $#runasuid;
-  $GID = $#runasgid;
+  $UID = $runasuid;
+  $GID = $runasgid;
   $ns->main_loop;
   close $writepipe;
 } else { # child process -- perform zone transfers and update database
