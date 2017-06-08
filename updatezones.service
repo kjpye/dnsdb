@@ -1,0 +1,12 @@
+[Unit]
+Description=Maintain dns database
+After=network.target
+
+[Service]
+ExecStart=/home/kevinp/src/dnsdb/updatezones
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=process
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

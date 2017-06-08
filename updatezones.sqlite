@@ -41,7 +41,8 @@ if($#ARGV >= 0) {
     $view //= 'unknown';
     if ($zone eq 'all') {
       my @zones;
-      my $dbh = DBI->connect("dbi:Pg:dbname=$db", '', '', {AutoCommit => 0});
+      #my $dbh = DBI->connect("dbi:Pg:dbname=$db", '', '', {AutoCommit => 0});
+      my $dbh = DBI->connect("dbi:SQLite:dbname=/tmp/dns-db.sqlite3", {AutoCommit => 0});
       my $sth = $dbh->prepare("SELECT zone.name, view.name, server.address
                                FROM zone, view, server
                                WHERE zone.view = view.viewid
@@ -194,7 +195,9 @@ sub update_zone {
   $view =~ s/\.*$//; # remove any trailing dots
 
 # open database
-  my $dbh = DBI->connect("dbi:Pg:dbname=$db", '', '', {AutoCommit => 0});
+  #my $dbh = DBI->connect("dbi:Pg:dbname=$db", '', '', {AutoCommit => 0});
+  my $dbh = DBI->connect("dbi:SQLite:dbname=/tmp/dns-db.sqlite3", {AutoCommit => 0});
+
 
 # get zone information
   my $sth = $dbh->prepare("SELECT zoneid
@@ -245,10 +248,15 @@ sub populate_new_zone {
   my $serverid = get_serverid ($server, $dbh);
 
 # create entry in zone table
-  my $sth = $dbh->prepare("INSERT INTO zone (name, view, server)
-                           VALUES           (?,    ?,    ?     )
-                           RETURNING   zoneid
+  my $sth = $dbh->prepare("INSERT INTO zone (zoneid, name, view, server)
+                           VALUES           (NULL,   ?,    ?,    ?     )
                           ");
+  $sth->execute($zone, $viewid, $serverid);
+  $sth = $dbh->prepare("SELECT zoneid FROM zone
+                        WHERE  name   = ?
+                          AND  view   = ?
+                          AND  server = ?
+                       ");
   $sth->execute($zone, $viewid, $serverid);
   while (my @row = $sth->fetchrow_array()) {
     $zoneid = $row[0];
@@ -438,7 +446,7 @@ sub prepare_db {
                               VALUES                (?,    ?,    ?,   ?      )
                              ");
   $del_a     = $dbh->prepare("UPDATE dns_a
-                              SET    deleted = now()
+                              SET    deleted = (datetime('now'))
                               WHERE  name = ?
                                 AND  zone = ?
                                 AND  ttl = ?
@@ -457,7 +465,7 @@ sub prepare_db {
                               VALUES                (?,    ?,    ?,   ?    )
                              ");
   $del_cname = $dbh->prepare("UPDATE dns_cname
-                              SET    deleted = now()
+                              SET    deleted = (datetime('now'))
                               WHERE  name = ?
                                 AND  zone = ?
                                 AND  ttl = ?
@@ -476,7 +484,7 @@ sub prepare_db {
                               VALUES                (?,    ?,    ?,   ?,        ?         )
                              ");
   $del_mx    = $dbh->prepare("UPDATE dns_mx
-                              SET    deleted = now()
+                              SET    deleted = (datetime('now'))
                               WHERE  name = ?
                                 AND  zone = ?
                                 AND  ttl = ?
@@ -497,7 +505,7 @@ sub prepare_db {
                               VALUES                (?,    ?,    ?,   ?      )
                              ");
   $del_ns    = $dbh->prepare("UPDATE dns_ns
-                              SET    deleted = now()
+                              SET    deleted = (datetime('now'))
                               WHERE  name = ?
                                 AND  zone = ?
                                 AND  ttl = ?
@@ -516,7 +524,7 @@ sub prepare_db {
                               VALUES                (?,    ?,    ?,   ?,       ?       )
                              ");
   $del_ptr   = $dbh->prepare("UPDATE dns_ptr
-                              SET    deleted = now()
+                              SET    deleted = (datetime('now'))
                               WHERE  name = ?
                                 AND  zone = ?
                                 AND  ttl = ?
@@ -534,7 +542,7 @@ sub prepare_db {
                                  AND  deleted IS NULL
                               ");
   $del_soa   = $dbh->prepare("UPDATE dns_soa
-                              SET    deleted = now()
+                              SET    deleted = datetime('now')
                               WHERE  zone = ?
                                 AND  ttl = ?
                                 AND  mname = ?
@@ -550,7 +558,7 @@ sub prepare_db {
                               VALUES                (?,    ?,    ?,   ?,        ?,      ?,    ?     )
                              ");
   $del_srv   = $dbh->prepare("UPDATE dns_srv
-                              SET    deleted = now()
+                              SET    deleted = datetime('now')
                               WHERE  name = ?
                                 AND  zone = ?
                                 AND  ttl = ?
@@ -575,7 +583,7 @@ sub prepare_db {
                               VALUES                (?,    ?,    ?,   ?      )
                              ");
   $del_txt   = $dbh->prepare("UPDATE dns_txt
-                              SET    deleted = now()
+                              SET    deleted = datetime('now')
                               WHERE  name = ?
                                 AND  zone = ?
                                 AND  ttl = ?
@@ -613,7 +621,7 @@ sub delete_entries {
 
   for my $type (@RRtypes) {
     my $sth = $dbh->prepare("UPDATE dns_$type    
-                             SET deleted       = now(),
+                             SET deleted       = datetime('now'),
                                  pendingdelete = 0
                              WHERE zone           = ?
                                AND pendingdelete  = 1
@@ -657,7 +665,7 @@ sub add_rr {
   } elsif ($type eq 'SRV') {
     $add_srv->execute($rr->name, $zoneid, $rr->ttl, $rr->priority, $rr->weight, $rr->port, $rr->target);
   } elsif ($type eq 'TXT') {
-    $add_txt->execute($rr->name, $zoneid, $rr->ttl, join('', $rr->txtdata));
+    $add_txt->execute($rr->name, $zoneid, $rr->ttl, $rr->txtdata);
   } else {
     # just ignore other types (including SOA) -- should probably raise an error somewhere
   }
@@ -741,7 +749,10 @@ sub replace_rr {
       $add_srv->execute($rr->name, $zoneid, $rr->ttl, $rr->priority, $rr->weight, $rr->port, $rr->target);
     }
   } elsif ($rr->type eq 'TXT') {
-    my$txtdata = join '', $rr->txtdata;
+my $name = $rr->name;
+my $ttl = $rr->ttl;
+my $txtdata = join '', $rr->txtdata;
+print "name: $name, zoneid: $zoneid, ttl: $ttl;, data: \"$txtdata\"\n";
     if(0 == $keep_txt->execute($rr->name, $zoneid, $rr->ttl, $txtdata)) {
       $add_txt->execute($rr->name, $zoneid, $rr->ttl, $txtdata);
     }
@@ -757,7 +768,7 @@ sub update_soa {
   my $dbh    = shift;
 
   my $sth = $dbh->prepare("UPDATE dns_soa
-                           SET    deleted = now()
+                           SET    deleted = datetime('now')
                            WHERE  zone    = ?
                              AND  deleted IS NULL
                           ");
