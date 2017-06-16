@@ -18,10 +18,9 @@ use Data::Dumper;
 my $runasuid = 1000; # kevinp
 my $runasgid = 100;  # users
 
-### End configuration
 my $verbose = 0;
-$verbose = 1; # uncomment for debugging
-$verbose = 2; # uncomment to dump data structures as well
+#$verbose = 1; # uncomment for debugging
+#$verbose = 2; # uncomment to dump data structures as well
 
 my $hasixfr = 0;
 my $hasiterator = 0;
@@ -30,10 +29,21 @@ my $keydir = '/etc/named.d/keys';
 
 # The list of record types we want to keep in the database.
 #   Don't mention SOA records here; they're treated specially.
+#   If you add more you'll need to add code to handle them below.
 
 my @RRtypes = qw(a cname mx ns ptr srv txt);
 
 my $db = 'dns2';
+
+### End configuration
+
+# Other global variables
+
+my %unknowntype = ();
+
+# Command line handling
+#   If there are any arguments, treat them as zones and update those zones
+#   Argument format is "server:zone[:view]" or "all" which will refresh all known zones.
 
 if($#ARGV >= 0) {
   for my $arg (@ARGV) {
@@ -71,6 +81,8 @@ if($#ARGV >= 0) {
 my $readpipe;
 my $writepipe;
 
+# Respond to anything other than NOTIFY with NOTIMP
+
 sub query_handler {
   my ($qname, $qclass, $qtype, $peerhost,$query,$conn) = @_;
   my ($rcode, @ans, @auth, @add);
@@ -80,6 +92,8 @@ sub query_handler {
   return ('NOTIMP', \@ans, \@auth, \@add);
 }
 
+# NOTIFY requests pass the relevant information through a pipe to the update fork
+
 sub notify_handler {
   my ($qname, $qclass, $qtype, $peerhost, $query, $conn) = @_;
   my ($rcode, @ans, @auth, @add);
@@ -87,25 +101,38 @@ sub notify_handler {
   print STDERR "Received notify from $peerhost to ". $conn->{sockhost}. "\n" if $verbose > 0;
   $query->print if $verbose > 1;
 
+# Find view
   my $view = 'unknown';
   for my $rr ($query->additional) {
     $view = $rr->name if $rr->type eq 'TSIG';
   }
+# notify other fork
   print $writepipe "$peerhost:$qname:$view\n";
+
+# Respond to the NOTIFY with NOERROR
+
   $rcode = 'NOERROR';
 
   return ($rcode, \@ans, \@auth, \@add);
 }
 
+# Make the pipe for inter-process communication
+
 pipe $readpipe, $writepipe;
+
+# Fork and process requests
 
 my $childid = fork();
 
 if ($childid) { # parent process -- wait for notify and send details to child
-  close $readpipe;
+  close $readpipe; # not used from this end
+
+# pipe needs to be unbuffered
   my $ofh = select $writepipe;
   $| = 1;
   select $ofh;
+
+# Create the name server
   my $ns = new Net::DNS::Nameserver(
                  LocalPort     => 53,
                  ReplyHandler  => \&query_handler,
@@ -115,19 +142,27 @@ if ($childid) { # parent process -- wait for notify and send details to child
 # Drop privilege (should be configurable)
   $UID = $runasuid;
   $GID = $runasgid;
+# Run the nameserver; shouldn't return
   $ns->main_loop;
   close $writepipe;
+  exit 1; # something went wrong
+
 } else { # child process -- perform zone transfers and update database
-  close $writepipe;
-# Drop privilege (configurable?)
+
+  close $writepipe; # not used from this end
+
+# Drop privilege
   $UID = $EUID = $runasuid;
   $GID = $EGID = $runasgid;
+
+# Loop processing requests
   while (my $z = <$readpipe>) {
     chomp $z;
     my ($server, $zone, $view) = split ':', $z;
     update_zone($server, $view, $zone);
   }
   close $readpipe;
+  exit 2; # should never get here
 }
 
 sub get_viewid {
@@ -139,7 +174,9 @@ sub get_viewid {
  
   print "View: \"$view\"\n" if $verbose > 0;
 
-# This would be nice, but requires Postgresql 9.5
+# TODO: generate new views on the fly
+#
+# This would be nice, but requires Postgresql 9.5 and not SQLite
 #
 #  my $sth = $dbh->prepare("INSERT INTO view (name)
 #                           VALUES (?)
@@ -166,7 +203,9 @@ sub get_serverid {
  
   print "Server ip: \"$ip\"\n" if $verbose > 0;
 
-# This would be nice, but requires Postgresql 9.5
+# TODO: Make new servers on the fly
+#
+# This would be nice, but requires Postgresql 9.5 and not SQLite
 #
 #  my $sth = $dbh->prepare("INSERT INTO server (ip)
 #                           VALUES (?)
@@ -184,11 +223,16 @@ sub get_serverid {
   $serverid;
 }
 
-# This is where all the real work is done
+### This is where all the real work is done
+
+# Update (or initialise) a zone
 
 sub update_zone {
   my ($server, $view, $zone) = @_;
   print "update_zone - args: $server, $view, $zone\n" if $verbose > 0;
+
+  %unknowntype = ();
+
   $zone =~ s/\.*$/./; # Canonicalise again!
   $view //= 'unknown';
   $view =~ s/\.*$//; # remove any trailing dots
@@ -221,11 +265,15 @@ sub update_zone {
   $dbh->disconnect();
 }
 
+# Turn an array into an iterator in case we're running an old version of Net::DNS
+
 sub make_iterator {
   my @rrs = @_;
   print "RRs are ", Dumper(\@rrs), "\n" if $verbose > 1;
   return sub { shift @rrs; };
 }
+
+# Populate a new zone
 
 sub populate_new_zone {
   my $server = shift;
@@ -245,6 +293,9 @@ sub populate_new_zone {
   my $serverid = get_serverid ($server, $dbh);
 
 # create entry in zone table
+#   There is a race condition here -- somebody else might have created the zone sonce we checked for it
+#   This is unlikely because we normally only have this process updating the database
+
   my $sth = $dbh->prepare("INSERT INTO zone (name, view, server)
                            VALUES           (?,    ?,    ?     )
                            RETURNING   zoneid
@@ -257,7 +308,8 @@ sub populate_new_zone {
 # fetch data and update tables
   my $soa = undef;
   my $res = new Net::DNS::Resolver(nameservers => [$server]) or die "Could not create resolver\n";
-  prepare_db($dbh);
+  prepare_db($dbh); # Create all the prepared SQL queries
+# add TSIG key if required
   if ($view ne 'unknown') {
     my $tsig = create Net::DNS::RR::TSIG("$keydir/$view.key");
     $res->tsig($tsig);
@@ -269,13 +321,13 @@ sub populate_new_zone {
     my @rrs = $res->axfr($zone);
     $nextrr = make_iterator(@rrs);
   }
-  $soa = $nextrr->();
+  $soa = $nextrr->(); # get first RR
   print "Initial SOA: ", Dumper(\$soa), "\n" if $verbose > 0;
-  while(my $rr = $nextrr->()) {
+  while(my $rr = $nextrr->()) { # process all the other entries
     add_rr($zoneid, $rr);
-  }
+  } 
 
-# update zone table with new zone
+# update soa table with new zone
   print "Updating soa\n" if $verbose > 0;
   if (defined $soa) {
     $sth = $dbh->prepare("INSERT INTO dns_soa (zone, name, ttl, mname, rname, serial, refresh, retry, expire, minimum)
@@ -658,8 +710,10 @@ sub add_rr {
     $add_srv->execute($rr->name, $zoneid, $rr->ttl, $rr->priority, $rr->weight, $rr->port, $rr->target);
   } elsif ($type eq 'TXT') {
     $add_txt->execute($rr->name, $zoneid, $rr->ttl, join('', $rr->txtdata));
+  } elsif ($type eq 'SOA') {
+    # ignore SOA records -- they're handled elsewhere
   } else {
-    # just ignore other types (including SOA) -- should probably raise an error somewhere
+    print STDERR "Unknown RR type $type in zone with id $zoneid\n" unless $unknowntype{$type}++;
   }
 }
 
@@ -669,18 +723,20 @@ sub del_rr {
   my $zoneid = shift;
   my $rr = shift;
 
-  if ($rr->type eq 'A') {
+  my $type = $rr->type;
+
+  if ($type eq 'A') {
     $del_a->execute($rr->name, $zoneid, $rr->ttl, $rr->address);
-  } elsif ($rr->type eq 'CNAME') {
+  } elsif ($type eq 'CNAME') {
     $del_cname->execute($rr->name, $zoneid, $rr->ttl, $rr->cname);
-  } elsif ($rr->type eq 'MX') {
+  } elsif ($type eq 'MX') {
     $del_a->execute($rr->name, $zoneid, $rr->ttl, $rr->exchange, $rr->preference);
-  } elsif ($rr->type eq 'NS') {
+  } elsif ($type eq 'NS') {
     $del_ns->execute($rr->name, $zoneid, $rr->ttl, $rr->nsdname);
-  } elsif ($rr->type eq 'PTR') {
+  } elsif ($type eq 'PTR') {
     my $address = name2ip $rr->name;
     $del_ptr->execute($rr->name, $zoneid, $rr->ttl, $address, $rr->ptrdname);
-  } elsif ($rr->type eq 'SOA') {
+  } elsif ($type eq 'SOA') { # Will we ever get here?
     $del_soa->execute($zoneid,
                       $rr->ttl,
                       $rr->mname,
@@ -692,12 +748,12 @@ sub del_rr {
                       $rr->minimum,
                       $zoneid
                      );
-  } elsif ($rr->type eq 'SRV') {
+  } elsif ($type eq 'SRV') {
     $del_srv->execute($rr->name, $zoneid, $rr->ttl, $rr->priority, $rr->weight, $rr->port, $rr->target);
-  } elsif ($rr->type eq 'TXT') {
+  } elsif ($type eq 'TXT') {
     $del_txt->execute($rr->name, $zoneid, $rr->ttl, $rr->txtdata);
   } else {
-    # just ignore other types -- should probably raise an error somewhere
+    print STDERR "Unknown RR type $type in zone with id $zoneid\n" unless $unknowntype{$type}++;
   }
 }
 
@@ -713,40 +769,44 @@ sub replace_rr {
   my $rr = shift;
   print "replace rr: ", Dumper(\$rr), "\n" if $verbose > 1;
 
-  if ($rr->type eq 'A') {
+  my $type = $rr->type;
+
+  if ($type eq 'A') {
     print "Updating A record\n" if $verbose > 0;
     if(0 == $keep_a->execute($rr->name, $zoneid, $rr->ttl, $rr->address)) {
       print "Adding new A record -- didn't already exist\n" if $verbose > 0;
       $add_a->execute($rr->name, $zoneid, $rr->ttl, $rr->address);
     }
-  } elsif ($rr->type eq 'CNAME') {
+  } elsif ($type eq 'CNAME') {
     if(0 == $keep_cname->execute($rr->name, $zoneid, $rr->ttl, $rr->cname)) {
       $add_cname->execute($rr->name, $zoneid, $rr->ttl, $rr->cname);
     }
-  } elsif ($rr->type eq 'MX') {
+  } elsif ($type eq 'MX') {
     if(0 == $keep_mx->execute($rr->name, $zoneid, $rr->ttl, $rr->exchange, $rr->preference)) {
       $add_mx->execute($rr->name, $zoneid, $rr->ttl, $rr->exchange, $rr->preference);
     }
-  } elsif ($rr->type eq 'NS') {
+  } elsif ($type eq 'NS') {
     if(0 == $keep_ns->execute($rr->name, $zoneid, $rr->ttl, $rr->nsdname)) {
       $add_ns->execute($rr->name, $zoneid, $rr->ttl, $rr->nsdname);
     }
-  } elsif ($rr->type eq 'PTR') {
+  } elsif ($type eq 'PTR') {
     my $address = name2ip $rr->name;
     if(0 == $keep_ptr->execute($rr->name, $zoneid, $rr->ttl, $address, $rr->ptrdname)) {
       $add_ptr->execute($rr->name, $zoneid, $rr->ttl, $address, $rr->ptrdname);
     }
-  } elsif ($rr->type eq 'SRV') {
+  } elsif ($type eq 'SRV') {
     if(0 == $keep_srv->execute($rr->name, $zoneid, $rr->ttl, $rr->priority, $rr->weight, $rr->port, $rr->target)) {
       $add_srv->execute($rr->name, $zoneid, $rr->ttl, $rr->priority, $rr->weight, $rr->port, $rr->target);
     }
-  } elsif ($rr->type eq 'TXT') {
+  } elsif ($type eq 'TXT') {
     my$txtdata = join '', $rr->txtdata;
     if(0 == $keep_txt->execute($rr->name, $zoneid, $rr->ttl, $txtdata)) {
       $add_txt->execute($rr->name, $zoneid, $rr->ttl, $txtdata);
     }
+  } elsif ($type eq 'SOA') {
+    # SOA records are handled elsewhere
   } else {
-    # just ignore other types (including SOA) -- should probably raise an error somewhere
+    print STDERR "Unknown RR type $type in zone with id $zoneid\n" unless $unknowntype{$type}++;
   }
 }
 
