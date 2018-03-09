@@ -7,10 +7,10 @@ create table view (
   name text unique
 );
 
-create sequence dns_server_id;
+create sequence server_id;
 
-create table dns_server (
-  id           bigint    primary key default nextval('dns_server_id'),
+create table server (
+  id           bigint    primary key default nextval('server_id'),
   name         text      default 'unknown',
   address      inet      not null,
   created      timestamp default now(),
@@ -28,7 +28,7 @@ create table zone (
   deleted      timestamp
 );
 
-create table dns_a (
+create table a (
   name          text,
   zone          bigint    references zone(zoneid),
   ttl           integer,
@@ -38,7 +38,7 @@ create table dns_a (
   pendingdelete integer default 0
 );
 
-create table dns_soa (
+create table soa (
   zone          integer,
   ttl           integer,
   mname         text,
@@ -52,7 +52,7 @@ create table dns_soa (
   deleted       timestamp
 );
 
-create table dns_cname (
+create table cname (
   name          text,
   zone          integer,
   ttl           integer,
@@ -62,7 +62,7 @@ create table dns_cname (
   pendingdelete integer default 0
 );
 
-create table dns_ptr (
+create table ptr (
   name          text,
   address       inet,
   zone          integer,
@@ -73,7 +73,7 @@ create table dns_ptr (
   pendingdelete integer default 0
 );
 
-create table dns_ns (
+create table ns (
   name          text,
   zone          integer,
   ttl           integer,
@@ -83,7 +83,7 @@ create table dns_ns (
   pendingdelete integer default 0
 );
 
-create table dns_txt (
+create table txt (
   name          text,
   zone          integer,
   ttl           integer,
@@ -93,7 +93,7 @@ create table dns_txt (
   pendingdelete integer default 0
 );
 
-create table dns_mx (
+create table mx (
   name          text,
   zone          integer,
   ttl           integer,
@@ -104,7 +104,7 @@ create table dns_mx (
   pendingdelete integer default 0
 );
 
-create table dns_srv (
+create table srv (
   name          text,
   zone          integer,
   ttl           integer,

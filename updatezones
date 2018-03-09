@@ -330,8 +330,8 @@ sub populate_new_zone {
 # update soa table with new zone
   print "Updating soa\n" if $verbose > 0;
   if (defined $soa) {
-    $sth = $dbh->prepare("INSERT INTO dns_soa (zone, name, ttl, mname, rname, serial, refresh, retry, expire, minimum)
-                          VALUES              (?,    ?,    ?,   ?,     ?,     ?,      ?,       ?,     ?,      ?      )
+    $sth = $dbh->prepare("INSERT INTO soa (zone, name, ttl, mname, rname, serial, refresh, retry, expire, minimum)
+                          VALUES          (?,    ?,    ?,   ?,     ?,     ?,      ?,       ?,     ?,      ?      )
                          ");
     $sth->execute($zoneid,
                   $zone,
@@ -361,7 +361,7 @@ sub update_existing_zone {
   print "Updating '$zone' ($server, $view, $zoneid)\n" if $verbose > 0;
 # Get the existing SOA as an object
   my $sth = $dbh->prepare("SELECT serial
-                           FROM dns_soa
+                           FROM soa
                            WHERE  zone = ?
                              AND  deleted IS NULL
                           ");
@@ -486,10 +486,10 @@ my $keep_txt;
 sub prepare_db {
   my $dbh = shift;
 
-  $add_a     = $dbh->prepare("INSERT INTO dns_a     (name, zone, ttl, address)
-                              VALUES                (?,    ?,    ?,   ?      )
+  $add_a     = $dbh->prepare("INSERT INTO a     (name, zone, ttl, address)
+                              VALUES            (?,    ?,    ?,   ?      )
                              ");
-  $del_a     = $dbh->prepare("UPDATE dns_a
+  $del_a     = $dbh->prepare("UPDATE a
                               SET    deleted = now()
                               WHERE  name = ?
                                 AND  zone = ?
@@ -497,7 +497,7 @@ sub prepare_db {
                                 AND  address = ?
                                 AND  deleted IS NULL
                              ");
-  $keep_a     = $dbh->prepare("UPDATE dns_a
+  $keep_a     = $dbh->prepare("UPDATE a
                               SET    pendingdelete = 0
                               WHERE  name = ?
                                 AND  zone = ?
@@ -505,10 +505,10 @@ sub prepare_db {
                                 AND  address = ?
                                 AND  deleted IS NULL
                              ");
-  $add_cname = $dbh->prepare("INSERT INTO dns_cname (name, zone, ttl, cname)
-                              VALUES                (?,    ?,    ?,   ?    )
+  $add_cname = $dbh->prepare("INSERT INTO cname (name, zone, ttl, cname)
+                              VALUES            (?,    ?,    ?,   ?    )
                              ");
-  $del_cname = $dbh->prepare("UPDATE dns_cname
+  $del_cname = $dbh->prepare("UPDATE cname
                               SET    deleted = now()
                               WHERE  name = ?
                                 AND  zone = ?
@@ -516,7 +516,7 @@ sub prepare_db {
                                 AND  cname = ?
                                 AND  deleted IS NULL
                              ");
-  $keep_cname = $dbh->prepare("UPDATE dns_cname
+  $keep_cname = $dbh->prepare("UPDATE cname
                               SET    pendingdelete = 0
                               WHERE  name = ?
                                 AND  zone = ?
@@ -524,10 +524,10 @@ sub prepare_db {
                                 AND  cname = ?
                                 AND  deleted IS NULL
                              ");
-  $add_mx    = $dbh->prepare("INSERT INTO dns_mx    (name, zone, ttl, exchange, preference)
-                              VALUES                (?,    ?,    ?,   ?,        ?         )
+  $add_mx    = $dbh->prepare("INSERT INTO mx    (name, zone, ttl, exchange, preference)
+                              VALUES            (?,    ?,    ?,   ?,        ?         )
                              ");
-  $del_mx    = $dbh->prepare("UPDATE dns_mx
+  $del_mx    = $dbh->prepare("UPDATE mx
                               SET    deleted = now()
                               WHERE  name = ?
                                 AND  zone = ?
@@ -536,7 +536,7 @@ sub prepare_db {
                                 AND  preference = ?
                                 AND  deleted IS NULL
                              ");
-  $keep_mx    = $dbh->prepare("UPDATE dns_mx
+  $keep_mx    = $dbh->prepare("UPDATE mx
                                SET    pendingdelete = 0
                                WHERE  name = ?
                                  AND  zone = ?
@@ -545,10 +545,10 @@ sub prepare_db {
                                  AND  preference = ?
                                  AND  deleted IS NULL
                               ");
-  $add_ns    = $dbh->prepare("INSERT INTO dns_ns    (name, zone, ttl, nsdname)
-                              VALUES                (?,    ?,    ?,   ?      )
+  $add_ns    = $dbh->prepare("INSERT INTO ns    (name, zone, ttl, nsdname)
+                              VALUES            (?,    ?,    ?,   ?      )
                              ");
-  $del_ns    = $dbh->prepare("UPDATE dns_ns
+  $del_ns    = $dbh->prepare("UPDATE ns
                               SET    deleted = now()
                               WHERE  name = ?
                                 AND  zone = ?
@@ -556,7 +556,7 @@ sub prepare_db {
                                 AND  nsdname = ?
                                 AND  deleted IS NULL
                              ");
-  $keep_ns    = $dbh->prepare("UPDATE dns_ns
+  $keep_ns    = $dbh->prepare("UPDATE ns
                                SET    pendingdelete = 0
                                WHERE  name = ?
                                  AND  zone = ?
@@ -564,10 +564,10 @@ sub prepare_db {
                                  AND  nsdname = ?
                                  AND  deleted IS NULL
                               ");
-  $add_ptr   = $dbh->prepare("INSERT INTO dns_ptr   (name, zone, ttl, address, ptrdname)
-                              VALUES                (?,    ?,    ?,   ?,       ?       )
+  $add_ptr   = $dbh->prepare("INSERT INTO ptr   (name, zone, ttl, address, ptrdname)
+                              VALUES            (?,    ?,    ?,   ?,       ?       )
                              ");
-  $del_ptr   = $dbh->prepare("UPDATE dns_ptr
+  $del_ptr   = $dbh->prepare("UPDATE ptr
                               SET    deleted = now()
                               WHERE  name = ?
                                 AND  zone = ?
@@ -576,7 +576,7 @@ sub prepare_db {
                                 AND  ptrdname = ?
                                 AND  deleted IS NULL
                              ");
-  $keep_ptr   = $dbh->prepare("UPDATE dns_ptr
+  $keep_ptr   = $dbh->prepare("UPDATE ptr
                                SET    pendingdelete = 0
                                WHERE  name = ?
                                  AND  zone = ?
@@ -585,7 +585,7 @@ sub prepare_db {
                                  AND  ptrdname = ?
                                  AND  deleted IS NULL
                               ");
-  $del_soa   = $dbh->prepare("UPDATE dns_soa
+  $del_soa   = $dbh->prepare("UPDATE soa
                               SET    deleted = now()
                               WHERE  zone = ?
                                 AND  ttl = ?
@@ -598,10 +598,10 @@ sub prepare_db {
                                 AND  minimum = ?
                                 AND  deleted IS NULL
                              ");
-  $add_srv   = $dbh->prepare("INSERT INTO dns_srv   (name, zone, ttl, priority, weight, port, target)
-                              VALUES                (?,    ?,    ?,   ?,        ?,      ?,    ?     )
+  $add_srv   = $dbh->prepare("INSERT INTO srv   (name, zone, ttl, priority, weight, port, target)
+                              VALUES            (?,    ?,    ?,   ?,        ?,      ?,    ?     )
                              ");
-  $del_srv   = $dbh->prepare("UPDATE dns_srv
+  $del_srv   = $dbh->prepare("UPDATE srv
                               SET    deleted = now()
                               WHERE  name = ?
                                 AND  zone = ?
@@ -612,7 +612,7 @@ sub prepare_db {
                                 AND  target = ?
                                 AND  deleted IS NULL
                              ");
-  $keep_srv   = $dbh->prepare("UPDATE dns_srv
+  $keep_srv   = $dbh->prepare("UPDATE srv
                                SET    pendingdelete = 0
                                WHERE  name = ?
                                  AND  zone = ?
@@ -623,10 +623,10 @@ sub prepare_db {
                                  AND  target = ?
                                  AND  deleted IS NULL
                               ");
-  $add_txt   = $dbh->prepare("INSERT INTO dns_txt   (name, zone, ttl, txtdata)
-                              VALUES                (?,    ?,    ?,   ?      )
+  $add_txt   = $dbh->prepare("INSERT INTO txt   (name, zone, ttl, txtdata)
+                              VALUES            (?,    ?,    ?,   ?      )
                              ");
-  $del_txt   = $dbh->prepare("UPDATE dns_txt
+  $del_txt   = $dbh->prepare("UPDATE txt
                               SET    deleted = now()
                               WHERE  name = ?
                                 AND  zone = ?
@@ -634,7 +634,7 @@ sub prepare_db {
                                 AND  txtdata = ?
                                 AND  deleted IS NULL
                              ");
-  $keep_txt   = $dbh->prepare("UPDATE dns_txt
+  $keep_txt   = $dbh->prepare("UPDATE txt
                                SET    pendingdelete = 0
                                WHERE  name = ?
                                  AND  zone = ?
@@ -649,7 +649,7 @@ sub set_delete {
   my $dbh = shift;
 
   for my $type (@RRtypes) {
-    my $sth = $dbh->prepare("UPDATE dns_$type    
+    my $sth = $dbh->prepare("UPDATE $type    
                              SET pendingdelete = 1
                              WHERE zone = ?
                                AND deleted IS NULL
@@ -664,7 +664,7 @@ sub delete_entries {
   my $dbh = shift;
 
   for my $type (@RRtypes) {
-    my $sth = $dbh->prepare("UPDATE dns_$type    
+    my $sth = $dbh->prepare("UPDATE $type    
                              SET deleted       = now(),
                                  pendingdelete = 0
                              WHERE zone           = ?
@@ -816,14 +816,14 @@ sub update_soa {
   my $soa    = shift;
   my $dbh    = shift;
 
-  my $sth = $dbh->prepare("UPDATE dns_soa
+  my $sth = $dbh->prepare("UPDATE soa
                            SET    deleted = now()
                            WHERE  zone    = ?
                              AND  deleted IS NULL
                           ");
   $sth->execute($zoneid);
-  $sth= $dbh->prepare("INSERT INTO dns_soa (zone, name, ttl, mname, rname, serial, refresh, retry, expire, minimum)
-                       VALUES              (?,    ?,    ?,   ?,     ?,     ?,      ?,       ?,     ?,      ?      )
+  $sth= $dbh->prepare("INSERT INTO soa (zone, name, ttl, mname, rname, serial, refresh, retry, expire, minimum)
+                       VALUES          (?,    ?,    ?,   ?,     ?,     ?,      ?,       ?,     ?,      ?      )
                       ");
   $sth->execute($zoneid,
                 $zone,
